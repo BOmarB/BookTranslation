@@ -1,0 +1,7 @@
+pdfplumber
+google-genai
+requests
+fpdf2
+uharfbuzz
+tkinterdnd2
+pyinstaller

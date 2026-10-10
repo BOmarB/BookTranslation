@@ -1,0 +1,13 @@
+# Secrets - never commit
+.env
+
+# Build outputs
+build/
+dist/
+__pycache__/
+*.pyc
+*.log
+
+# Book data (user content + progress state)
+*.pdf
+*.progress.jsonl
