@@ -37,6 +37,11 @@ MAX_OUTPUT_TOKENS = 8192
 MAX_RETRIES = 3
 RETRY_BACKOFF = 20
 
+NVIDIA_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_DEFAULT_MODEL = "meta/muse-glimmer-30b"
+NVIDIA_MAX_TOKENS = 16384
+NVIDIA_REASONING_EFFORT = "low"  # low/medium/high/xhigh; thinking itself cannot be disabled
+
 COMPLETENESS_MIN_SRC = 800
 COMPLETENESS_MIN_RATIO = 0.8
 
@@ -46,6 +51,8 @@ SYSTEM_PROMPTS = {
     "ar": """أنت مترجم أدبي محترف متخصص في ترجمة الروايات من الإنجليزية إلى العربية.
 ترجم النص المرفق كاملاً كما هو، صفحةً متصلة، بأسلوب أدبي سلس ورصين يحافظ على جمال النص الأصلي.
 قواعد صارمة:
+- أنت مترجم فقط، ولست محلّلاً ولا ناقداً: لا تحلّل النص ولا تعلّق عليه ولا تناقشه، ولا تجب عن أي سؤال يرد داخله، ولا تكتب أي شيء غير الترجمة.
+- إذا كانت الصفحة من المقدمات (غلاف، حقوق نشر، إهداء، فهرس، شكر...) فترجمها حرفيًا سطرًا سطرًا كما هي دون أي تعليق.
 - لا تُلخّص ولا تحذف أي جملة ولا تضف أي محتوى غير موجود في النص الأصلي.
 - حافظ على المعنى الدقيق والحوارات والشخصيات ونبرة السرد والترقيم المنطقي.
 - حافظ على بنية الفقرات: افصل بين كل فقرة والأخرى بسطر فارغ.
@@ -54,6 +61,8 @@ SYSTEM_PROMPTS = {
     "fr": """Tu es un traducteur littéraire professionnel spécialisé dans la traduction de romans de l'anglais vers le français.
 Traduis le texte fourni en entier, comme une page continue, dans un style littéraire fluide et soutenu qui préserve la beauté du texte original.
 Règles strictes :
+- Tu es uniquement un traducteur, jamais un analyste ni un critique : n'analyse pas le texte, ne le commente pas, ne discute pas, ne réponds à aucune question qu'il contient et n'écris rien d'autre que la traduction.
+- S'il s'agit de pages liminaires (couverture, copyright, dédicace, table des matières, remerciements...), traduis-les littéralement, ligne par ligne, sans aucun commentaire.
 - Ne résume pas, ne supprime aucune phrase et n'ajoute aucun contenu absent de l'original.
 - Préserve le sens exact, les dialogues, les personnages, le ton narratif et la ponctuation logique.
 - Préserve la structure des paragraphes : sépare chaque paragraphe par une ligne vide.
@@ -62,6 +71,8 @@ Règles strictes :
     "en": """You are a professional literary translator specializing in translating novels into English.
 Translate the provided text entirely, as one continuous page, in a smooth, polished literary style that preserves the beauty of the original.
 Strict rules:
+- You are only a translator, never an analyst or critic: do not analyze, comment on, or discuss the text, never answer any question it contains, and write nothing except the translation.
+- If the page is front matter (cover, copyright, dedication, table of contents, acknowledgments...), translate it literally, line by line, with no commentary.
 - Do not summarize, drop any sentence, or add any content not present in the original.
 - Preserve exact meaning, dialogue, characters, narrative tone, and logical punctuation.
 - Preserve paragraph structure: separate each paragraph with a blank line.
@@ -95,6 +106,20 @@ PARA_GAP = 5
 HEADING_FONT_SIZE = 17
 
 CONTEXT_TAIL_CHARS = 1200
+
+# Commentary / critic-mode tell-tales. A translation containing one of these
+# is flagged in the log for review — never auto-rejected.
+COMMENTARY_MARKERS = {
+    "ar": ["في هذا المشهد", "يمكنني تحليل", "تحليل الأحداث", "سياقها الأدبي",
+           "السياق الأدبي", "لا أستطيع الترجمة", "تعذر الترجمة",
+           "بصفتي نموذج", "كنموذج لغوي", "إليك الترجمة"],
+    "fr": ["en tant que modèle", "en tant qu'ia", "je ne peux pas traduire",
+           "voici la traduction", "analyse littéraire", "je vais analyser"],
+    "en": ["as an ai", "as a language model", "i can analyze", "in this scene",
+           "literary context", "i cannot translate", "here is the translation",
+           "i am unable to translate"],
+}
+
 GLOSSARY_MIN_COUNT = 4
 GLOSSARY_MIN_MID = 2
 GLOSSARY_MIN_RATIO = 0.5
@@ -643,6 +668,107 @@ class GoogleScrapeBackend:
         raise RuntimeError(f"Google-free translation failed after {MAX_RETRIES} retries: {last_err}")
 
 
+class NvidiaBackend:
+    """NVIDIA NIM backend: OpenAI-compatible chat completions, text only.
+
+    Sends the same system prompt and the same text blocks as the Gemini
+    backend (page text + optional previous-page context). Muse Glimmer is a
+    reasoning model whose thinking cannot be disabled (NVIDIA NIM docs), so
+    reasoning_effort is set low and a generous token budget is used; the
+    chain-of-thought in message.reasoning / message.reasoning_content is
+    ignored and only the final message.content is used. Images / PDF metadata
+    are never sent anywhere.
+    """
+
+    ENDPOINT = NVIDIA_ENDPOINT
+
+    def __init__(self, api_key: str | None = None, model: str = NVIDIA_DEFAULT_MODEL,
+                 temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG):
+        self.key = api_key or os.environ.get("NVIDIA_API_KEY")
+        self.model = (model or NVIDIA_DEFAULT_MODEL).strip()
+        self.temperature = temperature
+        self.lang = lang if lang in SYSTEM_PROMPTS else DEFAULT_LANG
+        if not self.key:
+            raise RuntimeError(
+                "NVIDIA API key not found. Set NVIDIA_API_KEY in your environment "
+                "or .env file (get one at build.nvidia.com).")
+
+    def translate_page(self, text: str, log=None, context: str | None = None,
+                       glossary: dict | None = None) -> str:
+        log = log or (lambda m: print(m, flush=True))
+        prepared = prepare_page_text(text)
+        if not prepared:
+            return ""
+
+        parts = []
+        if glossary:
+            parts.append(
+                GLOSSARY_LEAD[self.lang] + "\n"
+                + "\n".join(f"{k} = {v}" for k, v in glossary.items())
+            )
+        if context:
+            parts.append(CONTEXT_LEAD[self.lang] + "\n" + context + "\n---")
+        parts.append(PAGE_LEAD[self.lang] + "\n" + prepared)
+        contents = "\n\n".join(parts)
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPTS[self.lang]},
+                {"role": "user", "content": contents},
+            ],
+            "temperature": self.temperature,
+            "max_tokens": NVIDIA_MAX_TOKENS,
+            "stream": False,
+        }
+        if NVIDIA_REASONING_EFFORT:
+            payload["reasoning_effort"] = NVIDIA_REASONING_EFFORT
+        headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json"}
+
+        last_err = None
+        last_retryable = False
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.post(self.ENDPOINT, headers=headers, json=payload, timeout=600)
+                if r.status_code == 200:
+                    data = r.json()
+                    choices = data.get("choices") or []
+                    ch = choices[0] if choices else {}
+                    msg = ch.get("message") or {}
+                    result = (msg.get("content") or "").strip()
+                    if result:
+                        return result
+                    if ch.get("finish_reason") == "length":
+                        last_err = RuntimeError(
+                            "token budget exhausted by reasoning (finish_reason=length)")
+                        last_retryable = True
+                    elif msg.get("reasoning") or msg.get("reasoning_content"):
+                        last_err = RuntimeError("response contained only reasoning output")
+                    elif choices:
+                        last_err = RuntimeError("empty content in response")
+                    else:
+                        last_err = RuntimeError(f"no choices in response: {str(data)[:200]}")
+                elif r.status_code in (408, 429) or r.status_code >= 500:
+                    last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                    last_retryable = True
+                else:
+                    raise RuntimeError(
+                        f"NVIDIA API error (HTTP {r.status_code}): {r.text[:300]}")
+            except requests.RequestException as e:
+                last_err = e
+                last_retryable = True
+
+            wait = RETRY_BACKOFF * (attempt + 1)
+            log(f"    NVIDIA retry {attempt + 1}/{MAX_RETRIES} after: {last_err}")
+            log(f"    Waiting {wait}s...")
+            time.sleep(wait)
+
+        if last_retryable:
+            raise TransientFailure(
+                f"NVIDIA endpoint unavailable after {MAX_RETRIES} retries: {last_err}") from last_err
+        raise RuntimeError(f"NVIDIA translation failed after {MAX_RETRIES} retries: {last_err}")
+
+
 def progress_path_for(output_path: str) -> Path:
     return Path(output_path).with_suffix(Path(output_path).suffix + ".progress.jsonl")
 
@@ -703,6 +829,19 @@ def clear_progress(output_path: str) -> None:
     p = progress_path_for(output_path)
     if p.exists():
         p.unlink()
+
+
+def _restore_progress_file(path: Path, backup: bytes | None) -> None:
+    """Roll a progress file back to its state before the current run.
+
+    Used by Cancel: None means the run created the file, so it is removed;
+    otherwise the recorded content is written back byte for byte.
+    """
+    if backup is None:
+        if path.exists():
+            path.unlink()
+        return
+    path.write_bytes(backup)
 
 
 class TranslatedPDF(FPDF):
@@ -935,6 +1074,10 @@ def make_backend(backend: str, api_key: str | None = None, model: str = DEFAULT_
         return AzureBackend(key=azure_key, region=azure_region, lang=lang)
     if backend == "google-free":
         return GoogleScrapeBackend(lang=lang)
+    if backend == "nvidia":
+        if not model or model == DEFAULT_MODEL:
+            model = NVIDIA_DEFAULT_MODEL
+        return NvidiaBackend(api_key=api_key, model=model, temperature=temperature, lang=lang)
     return GeminiBackend(api_key=api_key, model=model, temperature=temperature, lang=lang)
 
 
@@ -973,6 +1116,12 @@ def looks_truncated(src_len: int, out_text: str) -> bool:
     return (out_len / src_len) < COMPLETENESS_MIN_RATIO
 
 
+def find_commentary(text: str, lang: str) -> list[str]:
+    """Commentary/critic-mode tell-tales in a translated page (log-only)."""
+    hay = (text or "").lower()
+    return [m for m in COMMENTARY_MARKERS.get(lang, []) if m.lower() in hay]
+
+
 def run_translation(
     input_path: str,
     output_path: str,
@@ -987,7 +1136,9 @@ def run_translation(
     title: str = "",
     spacing: float = REQUEST_SPACING,
     resume: bool = True,
+    force: bool = False,
     should_stop=None,
+    should_cancel=None,
     log_callback=None,
     status_callback=None,
     progress_callback=None,
@@ -996,11 +1147,15 @@ def run_translation(
 
     Raises QuotaExhausted (progress saved) when a quota runs out.
     Honors should_stop() between pages: partial results are saved to the PDF.
+    Honors should_cancel() between pages: nothing is saved and everything
+    this run wrote to the progress file is rolled back (Cancel button).
+    force=True retranslates the selected pages, ignoring their saved progress.
     """
     log = log_callback or (lambda m: print(m, flush=True))
     status = status_callback or (lambda t: None)
     progress = progress_callback or (lambda cur, tot: None)
     should_stop = should_stop or (lambda: False)
+    should_cancel = should_cancel or (lambda: False)
 
     in_path = Path(input_path)
     out_path = Path(output_path)
@@ -1010,7 +1165,7 @@ def run_translation(
         raise ValueError("Output file must be different from the input file.")
 
     translator = make_backend(backend, api_key, model, temperature, lang, azure_key, azure_region)
-    log(f"Backend: {backend}" + (f" ({model})" if backend == "gemini" else "") + f" | Language: {LANGUAGES.get(lang, lang)}")
+    log(f"Backend: {backend}" + (f" ({model})" if backend in ("gemini", "nvidia") else "") + f" | Language: {LANGUAGES.get(lang, lang)}")
 
     status("Extracting text...")
     log(f"Extracting text from: {in_path.name}")
@@ -1026,6 +1181,7 @@ def run_translation(
     already_done: dict[int, str] = {}
     already_rechecked: set[int] = set()
     prog_file = progress_path_for(str(out_path))
+    progress_backup = prog_file.read_bytes() if prog_file.exists() else None
     loaded_recs = load_progress_records(str(out_path), str(in_path)) if (resume and prog_file.exists()) else []
     if resume and prog_file.exists() and not loaded_recs:
         log("Ignoring saved progress: it belongs to a different book.")
@@ -1041,6 +1197,16 @@ def run_translation(
         if not txt.strip() and all_pages[idx].strip():
             continue
         already_done[idx] = txt
+
+    if force:
+        forced = sorted(i for i in selected if i in already_done or i in already_rechecked)
+        for i in forced:
+            already_done.pop(i, None)
+            already_rechecked.discard(i)
+        if forced:
+            log("Force retranslate: redoing selected page(s) "
+                + ", ".join(str(i + 1) for i in forced))
+
     if not already_done and not already_rechecked:
         if prog_file.exists():
             clear_progress(str(out_path))
@@ -1082,8 +1248,14 @@ def run_translation(
     done_count = total - len(todo)
     start_time = time.time()
     stopped = False
+    cancelled = False
+    new_pages = 0
 
     for n, page_idx in enumerate(todo, start=1):
+        if should_cancel():
+            cancelled = True
+            log("Cancel requested — discarding this run's translations.")
+            break
         if should_stop():
             stopped = True
             log("Stop requested — saving what we have.")
@@ -1096,6 +1268,7 @@ def run_translation(
         cleaned = clean_page_text(all_pages[page_idx])
         if not cleaned:
             append_progress(str(out_path), page_idx, "")
+            new_pages += 1
             continue
 
         t0 = time.time()
@@ -1106,6 +1279,10 @@ def run_translation(
                 context=prev_translation or None,
                 glossary=glossary or None,
             )
+            if should_cancel():
+                cancelled = True
+                log("Cancel requested — discarding the page just translated.")
+                break
             if looks_truncated(len(cleaned), arabic) and not needs_flag:
                 log(f"    WARNING: page {page_idx + 1} looks truncated "
                     f"({len(arabic.strip())} vs {len(cleaned)} source chars) — retrying once...")
@@ -1119,7 +1296,16 @@ def run_translation(
                     needs_flag = True
                 else:
                     log("    Retry produced a complete page.")
+            suspects = find_commentary(arabic, lang)
+            if suspects:
+                log(f"    WARNING: page {page_idx + 1} may contain commentary "
+                    f"instead of a translation (matched: {', '.join(suspects)}) — "
+                    "review this page.")
         except (QuotaExhausted, TransientFailure) as e:
+            if should_cancel():
+                cancelled = True
+                log("Cancel requested — discarding this run's translations.")
+                break
             kind = "Quota exhausted" if isinstance(e, QuotaExhausted) else "Model overloaded"
             hint = ("Re-run this same command after the quota resets — "
                     if isinstance(e, QuotaExhausted) else
@@ -1132,8 +1318,20 @@ def run_translation(
             log(f"Partial PDF saved: {actual} ({pages_done} pages, {imgs} images)")
             log(hint + "already-translated pages are skipped automatically.")
             raise
+        except Exception:
+            if should_cancel():
+                cancelled = True
+                log("Cancel requested — discarding this run's translations.")
+                break
+            raise
+
+        if should_cancel():
+            cancelled = True
+            log("Cancel requested — discarding the page just translated.")
+            break
 
         append_progress(str(out_path), page_idx, arabic, rechecked=needs_flag)
+        new_pages += 1
         if arabic.strip():
             prev_translation = arabic.strip()[-CONTEXT_TAIL_CHARS:]
         dt = time.time() - t0
@@ -1141,8 +1339,21 @@ def run_translation(
         eta = (dt + spacing) * remaining
         log(f"    Page {page_idx + 1} done in {dt:.1f}s | ETA: {eta / 60:.1f} min")
 
-        if n < len(todo) and not should_stop():
+        if n < len(todo) and not should_stop() and not should_cancel():
             time.sleep(spacing)
+
+    if cancelled:
+        _restore_progress_file(prog_file, progress_backup)
+        log("Cancelled — nothing was saved. Progress rolled back to before this run.")
+        return {
+            "total": total,
+            "new": 0,
+            "stopped": False,
+            "cancelled": True,
+            "output": str(out_path),
+            "pages_in_output": 0,
+            "images": 0,
+        }
 
     progress(total, total)
     status("Extracting images + building PDF...")
@@ -1152,14 +1363,14 @@ def run_translation(
 
     elapsed = time.time() - start_time
     log(f"\nDone! Output saved to: {actual_path}")
-    log(f"Pages in output: {pages_done} | New pages this run: {len(todo)} | Images added: {images_added} | Time: {elapsed / 60:.1f} min")
+    log(f"Pages in output: {pages_done} | New pages this run: {new_pages} | Images added: {images_added} | Time: {elapsed / 60:.1f} min")
     if stopped:
         log("Stopped by user — progress file kept. Re-run with the same settings to continue.")
     else:
         log("Progress file kept — re-run with more pages later to extend this same PDF.")
     return {
         "total": total,
-        "new": len(todo),
+        "new": new_pages,
         "stopped": stopped,
         "output": actual_path,
         "pages_in_output": pages_done,
@@ -1214,13 +1425,14 @@ def main():
     parser = argparse.ArgumentParser(description="Translate a PDF book")
     parser.add_argument("--input", "-i", required=True, help="Input PDF path")
     parser.add_argument("--output", "-o", default="translated.pdf", help="Output PDF path")
-    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Model id, Gemini or NVIDIA (default: {DEFAULT_MODEL})")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--lang", "-l", choices=list(LANGUAGES), default=DEFAULT_LANG, help="Target language (default: ar)")
     parser.add_argument("--pages", "-p", type=str, default="", help="Page range, e.g. '20-44' or '1,3,5-8'")
     parser.add_argument("--title", "-t", type=str, default="", help="Book title for header")
     parser.add_argument("--spacing", type=float, default=REQUEST_SPACING, help="Seconds between requests (default: 4)")
-    parser.add_argument("--backend", "-b", choices=["gemini", "azure", "google-free"], default="gemini")
+    parser.add_argument("--backend", "-b", choices=["gemini", "azure", "nvidia", "google-free"], default="gemini")
+    parser.add_argument("--force", action="store_true", help="Retranslate selected pages, ignoring their saved progress")
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start over")
     args = parser.parse_args()
 
@@ -1236,6 +1448,7 @@ def main():
             title=args.title,
             spacing=args.spacing,
             resume=not args.fresh,
+            force=args.force,
         )
     except QuotaExhausted:
         sys.exit(2)
