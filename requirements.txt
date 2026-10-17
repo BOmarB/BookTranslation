@@ -1,7 +1,10 @@
 pdfplumber
 google-genai
 requests
+translators
 fpdf2
-uharfbuzz
+arabic-reshaper
+python-bidi
+Pillow
 tkinterdnd2
 pyinstaller

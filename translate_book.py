@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Book Translator - Gemini Edition
-Translates a PDF book page-by-page (whole page, single request) into Arabic
-using the Gemini API, then builds an RTL Arabic PDF.
+Book Translator - Gemini / Azure / Google-free edition
+Translates a PDF book page-by-page (whole page, single request), keeping images
+and original page numbers, into Arabic / French / English.
 
 Usage:
-    python translate_book.py --input "book.pdf" --output "كتاب.pdf"
+    python translate_book.py --input "book.pdf" --output "translated.pdf"
 """
 
 import argparse
+import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -21,16 +24,129 @@ from fpdf import FPDF
 from google import genai
 from google.genai import types
 import pdfplumber
+from PIL import Image
+import arabic_reshaper
+from bidi.algorithm import get_display
 
 
 DEFAULT_MODEL = "gemini-flash-lite-latest"
 DEFAULT_TEMPERATURE = 0.6
+DEFAULT_LANG = "ar"
 REQUEST_SPACING = 4.0
-MAX_OUTPUT_TOKENS = 4096
+MAX_OUTPUT_TOKENS = 8192
 MAX_RETRIES = 3
 RETRY_BACKOFF = 20
 
-AZURE_TO_LANG = "ar"
+COMPLETENESS_MIN_SRC = 800
+COMPLETENESS_MIN_RATIO = 0.8
+
+LANGUAGES = {"ar": "Arabic", "fr": "French", "en": "English"}
+
+SYSTEM_PROMPTS = {
+    "ar": """أنت مترجم أدبي محترف متخصص في ترجمة الروايات من الإنجليزية إلى العربية.
+ترجم النص المرفق كاملاً كما هو، صفحةً متصلة، بأسلوب أدبي سلس ورصين يحافظ على جمال النص الأصلي.
+قواعد صارمة:
+- لا تُلخّص ولا تحذف أي جملة ولا تضف أي محتوى غير موجود في النص الأصلي.
+- حافظ على المعنى الدقيق والحوارات والشخصيات ونبرة السرد والترقيم المنطقي.
+- حافظ على بنية الفقرات: افصل بين كل فقرة والأخرى بسطر فارغ.
+- إذا احتوى النص على عنوان فصل أو جزء، ابدأ سطره بعلامتي ## متبوعتين بمسافة (مثال: ## الفصل الأول).
+- أعِد النص العربي المترجم فقط، بلا أي مقدمة أو تعليق أو علامات اقتباس حوله.""",
+    "fr": """Tu es un traducteur littéraire professionnel spécialisé dans la traduction de romans de l'anglais vers le français.
+Traduis le texte fourni en entier, comme une page continue, dans un style littéraire fluide et soutenu qui préserve la beauté du texte original.
+Règles strictes :
+- Ne résume pas, ne supprime aucune phrase et n'ajoute aucun contenu absent de l'original.
+- Préserve le sens exact, les dialogues, les personnages, le ton narratif et la ponctuation logique.
+- Préserve la structure des paragraphes : sépare chaque paragraphe par une ligne vide.
+- Si le texte contient un titre de chapitre ou de partie, commence sa ligne par ## suivi d'un espace (exemple : ## Chapitre premier).
+- Renvoie uniquement le texte traduit, sans introduction, commentaire ni guillemets autour.""",
+    "en": """You are a professional literary translator specializing in translating novels into English.
+Translate the provided text entirely, as one continuous page, in a smooth, polished literary style that preserves the beauty of the original.
+Strict rules:
+- Do not summarize, drop any sentence, or add any content not present in the original.
+- Preserve exact meaning, dialogue, characters, narrative tone, and logical punctuation.
+- Preserve paragraph structure: separate each paragraph with a blank line.
+- If the text contains a chapter or part title, start its line with ## followed by a space (example: ## Chapter One).
+- Return only the translated text, with no introduction, commentary, or surrounding quotes.""",
+}
+
+PAGE_LEAD = {
+    "ar": "ترجم صفحة الكتاب التالية:",
+    "fr": "Traduis la page suivante du livre :",
+    "en": "Translate the following book page:",
+}
+
+CONTEXT_LEAD = {
+    "ar": "ترجمة الصفحة السابقة (للسياق فقط — لا تترجم هذا الجزء، بل استخدمه للحفاظ على ثبات الأسماء والمصطلحات والأسلوب):",
+    "fr": "Traduction de la page précédente (contexte uniquement — ne traduis pas cette partie, utilise-la pour garder la cohérence des noms, des termes et du ton) :",
+    "en": "Previous page translation (context only — do NOT translate this part; use it to keep names, terms, and tone consistent):",
+}
+
+GLOSSARY_LEAD = {
+    "ar": "استخدم الترجمات التالية للأسماء والأعلام حرفيًا أينما ظهرت:",
+    "fr": "Utilise exactement les traductions suivantes pour les noms propres partout où ils apparaissent :",
+    "en": "Use exactly the following translations for proper names wherever they appear:",
+}
+
+FONT_REGULAR_FILE = "Amiri-Regular.ttf"
+FONT_BOLD_FILE = "Amiri-Bold.ttf"
+BODY_FONT_SIZE = 13
+BODY_LINE_HEIGHT = 9
+PARA_GAP = 5
+HEADING_FONT_SIZE = 17
+
+CONTEXT_TAIL_CHARS = 1200
+GLOSSARY_MIN_COUNT = 4
+GLOSSARY_MIN_MID = 2
+GLOSSARY_MIN_RATIO = 0.5
+GLOSSARY_COMMON_MID_KEEP = 10
+GLOSSARY_MAX_NAMES = 150
+GLOSSARY_STOPWORDS = {
+    "The", "A", "An", "And", "But", "Or", "For", "Nor", "Yet", "So",
+    "With", "From", "Into", "Upon", "Over", "Under", "After", "Before",
+    "Because", "When", "While", "Where", "Which", "That", "This", "These",
+    "Those", "They", "Them", "Their", "There", "Here", "What", "Who",
+    "Whom", "How", "Why", "Not", "No", "Yes", "You", "Your",
+    "Mr", "Mrs", "Ms", "Miss", "Dr", "St", "Sr", "Jr", "Vs",
+    "Chapter", "Part", "Book", "Page", "Hello", "Please", "Thank",
+    "Thanks", "Well", "Now", "Then", "Today", "Tonight", "Morning",
+    "Evening", "Night", "Day", "Year", "Years", "Time", "One", "Two",
+    "First", "I",
+}
+# Common English words: skipped as name candidates unless they appear
+# capitalized mid-sentence very often (i.e. used as a name, e.g. Society).
+GLOSSARY_COMMON_WORDS = {
+    "about", "above", "across", "against", "ago", "all", "almost", "alone",
+    "along", "already", "also", "always", "another", "any", "anybody",
+    "anyone", "anything", "anyway", "anywhere", "are", "around", "as",
+    "ask", "at", "away", "be", "been", "before", "behind", "being",
+    "best", "better", "between", "beyond", "both", "bring", "came",
+    "can", "come", "could", "did", "do", "does", "done", "down",
+    "each", "either", "else", "enough", "even", "ever", "every",
+    "everyone", "everything", "everywhere", "few", "following", "get",
+    "go", "goes", "gone", "got", "had", "has", "have", "having",
+    "however", "into", "its", "itself", "just", "know", "known",
+    "let", "like", "look", "looked", "made", "make", "many", "may",
+    "more", "most", "much", "must", "never", "nevertheless", "next",
+    "none", "nothing", "of", "off", "often", "on", "once", "only",
+    "onto", "other", "others", "otherwise", "ought", "our", "ours",
+    "out", "over", "own", "same", "see", "seen", "shall", "should",
+    "since", "so", "some", "somebody", "someone", "something",
+    "sometime", "sometimes", "somewhere", "still", "such", "take",
+    "taken", "than", "that", "the", "their", "theirs", "them",
+    "themselves", "then", "there", "therefore", "these", "they",
+    "thing", "things", "think", "third", "those", "though", "through",
+    "thus", "to", "together", "too", "toward", "towards", "under",
+    "until", "up", "upon", "us", "use", "used", "very", "want",
+    "was", "we", "well", "went", "were", "what", "whatever", "when",
+    "whence", "whenever", "where", "whereas", "whereby", "wherein",
+    "whether", "which", "while", "whither", "who", "whoever", "whole",
+    "whom", "whose", "why", "will", "with", "within", "without",
+    "would", "yes", "yet", "you", "your", "yours", "yourself",
+}
+LEAD_STRIP_CHARS = " \t'\"(*-‑–—‘’“”"
+
+IMAGE_MIN_SIDE = 80
+IMAGE_EXTS = ("png", "jpeg", "jpg", "gif")
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -59,16 +175,13 @@ def load_env_file(path: str = ".env") -> None:
 
 load_env_file()
 
-SYSTEM_PROMPT = """أنت مترجم أدبي محترف متخصص في ترجمة الروايات من الإنجليزية إلى العربية.
-ترجم النص المرفق كاملاً كما هو، صفحةً متصلة، بأسلوب أدبي سلس ورصين يحافظ على جمال النص الأصلي.
-قواعد صارمة:
-- لا تُلخّص ولا تحذف أي جملة ولا تضف أي محتوى غير موجود في النص الأصلي.
-- حافظ على المعنى الدقيق والحوارات والشخصيات ونبرة السرد والترقيم المنطقي.
-- أعِد النص العربي المترجم فقط، بلا أي مقدمة أو تعليق أو علامات اقتباس حوله."""
-
 
 class QuotaExhausted(Exception):
-    """Raised when the Gemini free-tier daily/minute quota is exhausted."""
+    """Raised when a backend's quota is exhausted."""
+
+
+class TransientFailure(Exception):
+    """Raised when the model stays unavailable after all retries (e.g. 503)."""
 
 
 def clean_page_text(text: str) -> str:
@@ -76,13 +189,121 @@ def clean_page_text(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
+def resource_path(*parts: str) -> str:
+    """Resolve a bundled file both as a script and as a frozen EXE."""
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return str(base.joinpath(*parts))
+
+
+def prepare_page_text(text: str) -> str:
+    """Normalize a page for the model: collapse wrapped lines into spaces
+    but keep blank lines as paragraph separators."""
+    if not text or not text.strip():
+        return ""
+    paras = []
+    current: list[str] = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s:
+            current.append(s)
+        elif current:
+            paras.append(" ".join(current))
+            current = []
+    if current:
+        paras.append(" ".join(current))
+    return "\n\n".join(paras)
+
+
+def extract_name_candidates(all_pages: list[str]) -> list[str]:
+    """Find likely proper names: capitalized words/phrases (up to 3 words).
+
+    A candidate must occur >= GLOSSARY_MIN_COUNT times, at least
+    GLOSSARY_MIN_MID times truly mid-sentence (leading quotes/dashes don't
+    count as sentence starts), with mid/total >= GLOSSARY_MIN_RATIO.
+    Candidates made only of common English words are kept only when used
+    as a name very often (mid >= GLOSSARY_COMMON_MID_KEEP).
+    Sorted by frequency, capped at GLOSSARY_MAX_NAMES.
+    """
+    from collections import Counter
+    total: Counter = Counter()
+    mid: Counter = Counter()
+    pat = re.compile(r"\b([A-Z][a-z]+(?:'[a-z]+)?(?:\s+[A-Z][a-z]+(?:'[a-z]+)?){0,2})\b")
+    for page in all_pages:
+        text = re.sub(r"\s+", " ", page or "")
+        if not text:
+            continue
+        for sent in re.split(r"(?<=[.!?])\s+", text):
+            stripped = sent.lstrip(LEAD_STRIP_CHARS)
+            offset = len(sent) - len(stripped)
+            for m in pat.finditer(sent):
+                tokens = [re.sub(r"'s$", "", t) for t in m.group(1).split()]
+                tokens = [t for t in tokens if t not in GLOSSARY_STOPWORDS and len(t) >= 2]
+                if not tokens:
+                    continue
+                key = " ".join(tokens)
+                total[key] += 1
+                if m.start() > offset:
+                    mid[key] += 1
+    kept = []
+    for key, count in total.items():
+        if count < GLOSSARY_MIN_COUNT or mid[key] < GLOSSARY_MIN_MID:
+            continue
+        if mid[key] / count < GLOSSARY_MIN_RATIO:
+            continue
+        if all(t.lower() in GLOSSARY_COMMON_WORDS for t in key.split()):
+            if mid[key] < GLOSSARY_COMMON_MID_KEEP:
+                continue
+        kept.append((count, key))
+    kept.sort(reverse=True)
+    return [k for _, k in kept[:GLOSSARY_MAX_NAMES]]
+
+
+def build_glossary(all_pages: list[str], gemini_backend, lang: str, log=None) -> dict[str, str]:
+    """Translate the book's proper names once, in a single request.
+
+    Returns {english_name: translation}. Never raises — returns {} on failure
+    so the translation run can continue without a glossary.
+    """
+    log = log or (lambda m: print(m, flush=True))
+    names = extract_name_candidates(all_pages)
+    if not names:
+        return {}
+    shown = ", ".join(names[:25]) + ("..." if len(names) > 25 else "")
+    log(f"  Glossary candidates ({len(names)}): {shown}")
+    target = LANGUAGES.get(lang, lang)
+    prompt = (
+        f"Translate each of the following proper names from English into {target}. "
+        "Return ONLY lines in the exact format 'English = Translation', "
+        "one per line, no numbering, no commentary:\n" + "\n".join(names)
+    )
+    try:
+        resp = gemini_backend.client.models.generate_content(
+            model=gemini_backend.model, contents=prompt
+        )
+        glossary: dict[str, str] = {}
+        for line in (resp.text or "").splitlines():
+            if "=" in line:
+                en, _, tr = line.partition("=")
+                en, tr = en.strip(), tr.strip()
+                if en and tr:
+                    glossary[en] = tr
+        log(f"  Glossary fixed ({len(glossary)} names).")
+        return glossary
+    except Exception as e:
+        log(f"  Glossary step skipped ({e}); continuing without it.")
+        return {}
+
+
+def count_pages(input_path: str) -> int:
+    with pdfplumber.open(input_path) as pdf:
+        return len(pdf.pages)
+
+
 def extract_text_from_pdf(input_path: str) -> list[str]:
     pages = []
     with pdfplumber.open(input_path) as pdf:
-        for page in enumerate(pdf.pages):
-            i = page[0]
-            page_obj = page[1]
-            text = page_obj.extract_text() or ""
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
             pages.append(text)
     return pages
 
@@ -103,16 +324,155 @@ def parse_pages(pages_str: str, total: int) -> set[int]:
     return selected
 
 
+def _decode_image(img: dict) -> tuple[bytes, str] | None:
+    """Decode a pdfplumber image dict into (bytes, ext). Returns None if undecodable."""
+    stream = img.get("stream")
+    if stream is None:
+        return None
+    try:
+        data = stream.get_data()
+    except Exception:
+        return None
+    if not data:
+        return None
+
+    # 1) Direct decode (DCTDecode -> JPEG, JPX, etc.)
+    try:
+        pil = Image.open(io.BytesIO(data))
+        pil.load()
+        out = io.BytesIO()
+        pil.convert("RGB").save(out, format="JPEG", quality=92)
+        return out.getvalue(), "jpg"
+    except Exception:
+        pass
+
+    # 2) Raw bitmap reconstruction (FlateDecode images)
+    try:
+        bits = int(img.get("bits") or 8)
+        srcsize = img.get("srcsize") or (0, 0)
+        w, h = int(srcsize[0]), int(srcsize[1])
+        if w <= 0 or h <= 0:
+            return None
+        cs = img.get("colorspace") or []
+        cs_name = str(cs[0]) if cs else "/DeviceGray"
+        if bits == 1:
+            mode = "1"
+        elif bits == 8:
+            mode = "RGB" if "RGB" in cs_name else ("CMYK" if "CMYK" in cs_name else "L")
+        else:
+            mode = "L"
+        need = w * h * (3 if mode == "RGB" else 1)
+        if len(data) < need:
+            return None
+        pil = Image.frombytes(mode, (w, h), data)
+        out = io.BytesIO()
+        pil.save(out, format="PNG")
+        return out.getvalue(), "png"
+    except Exception:
+        return None
+
+
+def extract_images(input_path: str, dest_dir: str, page_indices: set[int] | None = None) -> dict[int, list[dict]]:
+    """Extract meaningful images per page from the source PDF.
+
+    Returns {page_index: [{"path": str, "rel_top": float, "w": int, "h": int}, ...]}
+    where rel_top is the image's vertical position as a 0..1 fraction of the page.
+    """
+    result: dict[int, list[dict]] = {}
+    os.makedirs(dest_dir, exist_ok=True)
+    with pdfplumber.open(input_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            if page_indices is not None and i not in page_indices:
+                continue
+            try:
+                images = page.images
+            except Exception:
+                continue
+            page_h = page.height or 1.0
+            for j, img in enumerate(images):
+                srcsize = img.get("srcsize") or (0, 0)
+                w, h = int(srcsize[0] or 0), int(srcsize[1] or 0)
+                if w < IMAGE_MIN_SIDE or h < IMAGE_MIN_SIDE:
+                    continue
+                decoded = _decode_image(img)
+                if decoded is None:
+                    continue
+                data, ext = decoded
+                path = str(Path(dest_dir) / f"img_p{i + 1}_{j}.{ext}")
+                try:
+                    with open(path, "wb") as f:
+                        f.write(data)
+                except OSError:
+                    continue
+                result.setdefault(i, []).append({
+                    "path": path,
+                    "rel_top": max(0.0, min(1.0, (img.get("top", 0) or 0) / page_h)),
+                    "w": w,
+                    "h": h,
+                })
+    return result
+
+
+def vt_scan_file(path: str, poll_interval: float = 2.0, timeout: float = 120.0) -> dict:
+    """Scan a file with VirusTotal. Returns a summary dict (with 'error' on failure)."""
+    key = os.environ.get("VT_API_KEY")
+    if not key:
+        return {"error": "no key"}
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return {"error": str(e)}
+
+    headers_base = {"x-apikey": key}
+    try:
+        r = requests.post(
+            "https://www.virustotal.com/api/v3/files",
+            headers=headers_base,
+            files={"file": (Path(path).name, data)},
+            timeout=90,
+        )
+        if r.status_code == 409:
+            # same file submitted moments ago — wait and retry once
+            time.sleep(5)
+            r = requests.post(
+                "https://www.virustotal.com/api/v3/files",
+                headers=headers_base,
+                files={"file": (Path(path).name, data)},
+                timeout=90,
+            )
+        if r.status_code != 200:
+            return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
+        analysis_id = r.json()["data"]["id"]
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            a = requests.get(
+                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
+                headers={"x-apikey": key},
+                timeout=30,
+            )
+            attrs = a.json().get("data", {}).get("attributes", {})
+            if attrs.get("status") == "completed":
+                stats = attrs.get("stats", {})
+                return {"stats": stats, "error": None}
+            time.sleep(poll_interval)
+        return {"error": "scan timed out"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 class GeminiBackend:
-    """Pluggable translation backend: one call per whole page."""
+    """Gemini backend: one call per whole page."""
 
     def __init__(self, api_key: str | None = None, model: str = DEFAULT_MODEL,
-                 temperature: float = DEFAULT_TEMPERATURE,
-                 thinking_budget: int | None = None):
+                 temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG):
         self.model = model
         self.temperature = temperature
+        self.lang = lang if lang in SYSTEM_PROMPTS else DEFAULT_LANG
+        prompt = SYSTEM_PROMPTS.get(lang, SYSTEM_PROMPTS[DEFAULT_LANG])
         self.config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=prompt,
             temperature=temperature,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             safety_settings=[
@@ -125,8 +485,6 @@ class GeminiBackend:
                 )
             ],
         )
-        if thinking_budget is not None:
-            self.config.thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
         try:
             self.client = genai.Client(api_key=api_key) if api_key else genai.Client()
         except Exception as e:
@@ -146,18 +504,31 @@ class GeminiBackend:
                 return True
         return False
 
-    def translate_page(self, text: str, log=None) -> str:
+    def translate_page(self, text: str, log=None, context: str | None = None,
+                       glossary: dict | None = None) -> str:
         log = log or (lambda m: print(m, flush=True))
-        cleaned = clean_page_text(text)
-        if not cleaned:
+        prepared = prepare_page_text(text)
+        if not prepared:
             return ""
 
+        parts = []
+        if glossary:
+            parts.append(
+                GLOSSARY_LEAD[self.lang] + "\n"
+                + "\n".join(f"{k} = {v}" for k, v in glossary.items())
+            )
+        if context:
+            parts.append(CONTEXT_LEAD[self.lang] + "\n" + context + "\n---")
+        parts.append(PAGE_LEAD[self.lang] + "\n" + prepared)
+        contents = "\n\n".join(parts)
+
         last_err = None
+        last_retryable = False
         for attempt in range(MAX_RETRIES):
             try:
                 response = self.client.models.generate_content(
                     model=self.model,
-                    contents=cleaned,
+                    contents=contents,
                     config=self.config,
                 )
                 result = (response.text or "").strip()
@@ -170,12 +541,16 @@ class GeminiBackend:
                 if not self._is_retryable(e):
                     raise RuntimeError(f"Gemini API error (not retrying): {e}") from e
                 last_err = e
+                last_retryable = True
 
             wait = RETRY_BACKOFF * (attempt + 1)
             log(f"    Retry {attempt + 1}/{MAX_RETRIES} after error: {last_err}")
             log(f"    Waiting {wait}s...")
             time.sleep(wait)
 
+        if last_retryable:
+            raise TransientFailure(
+                f"Model unavailable after {MAX_RETRIES} retries: {last_err}") from last_err
         raise RuntimeError(f"Translation failed after {MAX_RETRIES} retries: {last_err}")
 
 
@@ -184,16 +559,18 @@ class AzureBackend:
 
     ENDPOINT = "https://api.cognitive.microsofttranslator.com/translate"
 
-    def __init__(self, key: str | None = None, region: str | None = None):
+    def __init__(self, key: str | None = None, region: str | None = None, lang: str = DEFAULT_LANG):
         self.key = key or os.environ.get("AZURE_TRANSLATOR_KEY")
         self.region = region or os.environ.get("AZURE_TRANSLATOR_REGION") or "global"
+        self.lang = lang
         if not self.key:
             raise RuntimeError(
                 "Azure Translator key not found. Set AZURE_TRANSLATOR_KEY (and AZURE_TRANSLATOR_REGION) "
-                "in your environment or .env file."
+                "in your environment or .env file, or paste the key in the app."
             )
 
-    def translate_page(self, text: str, log=None) -> str:
+    def translate_page(self, text: str, log=None, context: str | None = None,
+                       glossary: dict | None = None) -> str:
         cleaned = clean_page_text(text)
         if not cleaned:
             return ""
@@ -203,7 +580,7 @@ class AzureBackend:
             try:
                 response = requests.post(
                     self.ENDPOINT,
-                    params={"api-version": "3.0", "from": "en", "to": AZURE_TO_LANG},
+                    params={"api-version": "3.0", "from": "en", "to": self.lang},
                     headers={
                         "Ocp-Apim-Subscription-Key": self.key,
                         "Ocp-Apim-Subscription-Region": self.region,
@@ -226,6 +603,46 @@ class AzureBackend:
         raise RuntimeError(f"Azure translation failed after {MAX_RETRIES} retries: {last_err}")
 
 
+class GoogleScrapeBackend:
+    """Free Google Translate via the unofficial `translators` endpoint (no key)."""
+
+    def __init__(self, lang: str = DEFAULT_LANG):
+        self.lang = lang
+        try:
+            import translators as ts
+            self._ts = ts
+        except ImportError as e:
+            raise RuntimeError("The 'translators' package is required for the google-free backend.") from e
+
+    def translate_page(self, text: str, log=None, context: str | None = None,
+                       glossary: dict | None = None) -> str:
+        cleaned = clean_page_text(text)
+        if not cleaned:
+            return ""
+
+        last_err = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                result = self._ts.translate_text(
+                    cleaned, translator="google", from_language="en", to_language=self.lang
+                )
+                if result and result.strip():
+                    return result.strip()
+                last_err = RuntimeError("empty result")
+            except Exception as e:
+                msg = str(e).lower()
+                if "too many requests" in msg or "429" in msg:
+                    raise QuotaExhausted(str(e)) from e
+                last_err = e
+
+            wait = RETRY_BACKOFF * (attempt + 1)
+            if log:
+                log(f"    Google-free retry {attempt + 1}/{MAX_RETRIES}: {last_err}")
+            time.sleep(wait)
+
+        raise RuntimeError(f"Google-free translation failed after {MAX_RETRIES} retries: {last_err}")
+
+
 def progress_path_for(output_path: str) -> Path:
     return Path(output_path).with_suffix(Path(output_path).suffix + ".progress.jsonl")
 
@@ -241,12 +658,12 @@ def init_progress(output_path: str, input_path: str) -> None:
         f.write(json.dumps({"_meta": True, "input": str(Path(input_path).resolve()), "size": size}, ensure_ascii=False) + "\n")
 
 
-def load_progress(output_path: str, input_path: str | None = None) -> dict[int, str]:
-    """Return {page_index: translated_text}. Empty if the progress belongs to a different book."""
+def load_progress_records(output_path: str, input_path: str | None = None) -> list[dict]:
+    """Raw progress records (each with page/text/rechecked keys)."""
     p = progress_path_for(output_path)
-    done: dict[int, str] = {}
+    recs: list[dict] = []
     if not p.exists():
-        return done
+        return recs
     meta_ok = input_path is None
     with open(p, encoding="utf-8") as f:
         for line in f:
@@ -267,14 +684,19 @@ def load_progress(output_path: str, input_path: str | None = None) -> dict[int, 
                         meta_ok = True
                 continue
             if "page" in rec:
-                done[rec["page"]] = rec.get("text", "")
-    return done if meta_ok else {}
+                recs.append(rec)
+    return recs if meta_ok else []
 
 
-def append_progress(output_path: str, page_index: int, text: str) -> None:
+def load_progress(output_path: str, input_path: str | None = None) -> dict[int, str]:
+    """Return {page_index: translated_text}. Empty if the progress belongs to a different book."""
+    return {r["page"]: r.get("text", "") for r in load_progress_records(output_path, input_path)}
+
+
+def append_progress(output_path: str, page_index: int, text: str, rechecked: bool = False) -> None:
     p = progress_path_for(output_path)
     with open(p, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"page": page_index, "text": text}, ensure_ascii=False) + "\n")
+        f.write(json.dumps({"page": page_index, "text": text, "rechecked": rechecked}, ensure_ascii=False) + "\n")
 
 
 def clear_progress(output_path: str) -> None:
@@ -283,28 +705,103 @@ def clear_progress(output_path: str) -> None:
         p.unlink()
 
 
-class ArabicPDF(FPDF):
-    """RTL Arabic PDF using fpdf2's built-in HarfBuzz text shaping.
+class TranslatedPDF(FPDF):
+    """Output PDF: pre-shaped visual-order text, one run per line.
 
-    Logical-order Arabic is passed straight to multi_cell; the shaping
-    engine handles presentation forms and bidi per line, so sentence
-    and line order stays top-to-bottom in reading order.
+    Shaping (arabic_reshaper + bidi) happens per paragraph BEFORE wrapping,
+    and lines are broken manually by measured width. fpdf2's HarfBuzz engine
+    stays OFF, so the content stream holds normal line-level runs with
+    standard advances — the pattern every PDF importer (including Word's)
+    reads cleanly. Wrapping visual-order text ourselves is what keeps line
+    order correct (letting multi_cell wrap visual text reverses lines).
+    RTL shaping applies to Arabic only; French/English pass through.
+
+    Every page keeps the SOURCE book's page number in the footer.
     """
 
-    def __init__(self, title: str = ""):
+    def __init__(self, title: str = "", lang: str = DEFAULT_LANG):
         super().__init__()
         self.book_title = title
-        self.add_font("Noto", "", r"C:\Windows\Fonts\arial.ttf")
-        self.set_text_shaping(use_shaping_engine=True, direction="rtl", language="ar")
+        self.lang = lang
+        self.rtl = lang == "ar"
+        self.font_family = "Book"
+        self.has_bold = True
+        try:
+            self.add_font("Book", "", resource_path("fonts", FONT_REGULAR_FILE))
+            self.add_font("Book", "B", resource_path("fonts", FONT_BOLD_FILE))
+        except Exception as e:
+            print(f"    (bundled font missing, falling back to Arial: {e})")
+            self.add_font("Book", "", r"C:\Windows\Fonts\arial.ttf")
+            self.has_bold = False
         self.set_auto_page_break(auto=True, margin=25)
         self.set_margins(left=20, top=20, right=20)
+        self._page_numbers: dict[int, int] = {}
+        self.display_no: int | None = None
+
+    def _shape(self, text: str) -> str:
+        """Logical-order text -> visual-order shaped text (RTL only)."""
+        if not self.rtl:
+            return text
+        return get_display(arabic_reshaper.reshape(text))
+
+    @staticmethod
+    def _para_is_rtl(logical_para: str, default: bool) -> bool:
+        """Base direction of a logical paragraph: first strong character wins.
+
+        This mirrors the bidi base-direction detection, so chunk order below
+        matches how the paragraph is actually read.
+        """
+        for ch in logical_para.strip():
+            if ("\u0590" <= ch <= "\u08FF" or "\uFB1D" <= ch <= "\uFDFF"
+                    or "\uFE70" <= ch <= "\uFEFF"):
+                return True
+            if "A" <= ch <= "Z" or "a" <= ch <= "z":
+                return False
+        return default
+
+    def _wrap_visual(self, visual: str, max_width: float, tail_first: bool) -> list[str]:
+        """Break already-visual-order text into width-fitting lines.
+
+        tail_first=True (RTL-base paragraphs: reading starts at the visual
+        tail): chunks are formed from the end of the word list and emitted
+        tail-chunk-first. tail_first=False (LTR-base): normal front-to-back.
+        Each chunk keeps visual-internal order, and cuts happen only at
+        spaces, so mixed-direction paragraphs stay display-correct either
+        way. Must only be called on shaped (visual) text — never logical.
+        """
+        words = [w for w in visual.split(" ") if w]
+        seq = list(reversed(words)) if tail_first else list(words)
+        lines: list[str] = []
+        current: list[str] = []
+        for w in seq:
+            trial = " ".join(([w] + current) if tail_first else (current + [w]))
+            if self.get_string_width(trial) <= max_width:
+                if tail_first:
+                    current.insert(0, w)
+                else:
+                    current.append(w)
+            else:
+                if current:
+                    lines.append(" ".join(current))
+                current = [w]
+        if current:
+            lines.append(" ".join(current))
+        return lines
+
+    def add_page(self, orientation="", format="", same=False, duration=0.0,
+                 transition=None, label_style=None, label_prefix=None, label_start=None):
+        super().add_page(orientation=orientation, format=format, same=same, duration=duration)
+        # snapshot the source page number for THIS pdf page at creation time,
+        # so content that spills onto a new page keeps the original number
+        self._page_numbers[self.page_no()] = self.display_no or self.page_no()
 
     def header(self):
         if self.page_no() == 1:
             return
-        self.set_font("Noto", size=9)
+        self.set_font(self.font_family, size=9)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 8, self.book_title, align="C", new_x="LMARGIN", new_y="NEXT")
+        align = "R" if self.rtl else "L"
+        self.cell(0, 8, self._shape(self.book_title), align=align, new_x="LMARGIN", new_y="NEXT")
         self.set_draw_color(200, 200, 200)
         self.line(20, self.get_y(), self.w - 20, self.get_y())
         self.ln(4)
@@ -314,23 +811,166 @@ class ArabicPDF(FPDF):
         self.set_draw_color(200, 200, 200)
         self.line(20, self.get_y(), self.w - 20, self.get_y())
         self.ln(3)
-        self.set_font("Noto", size=9)
+        self.set_font(self.font_family, size=9)
         self.set_text_color(120, 120, 120)
-        self.cell(0, 8, str(self.page_no()), align="C")
+        align = "R" if self.rtl else "L"
+        number = self._page_numbers.get(self.page_no(), self.page_no())
+        self.cell(0, 8, str(number), align=align)
 
-    def add_translated_page(self, text: str):
+    def add_entry(self, text: str, page_number: int | None = None, images: list[dict] | None = None):
+        self.display_no = page_number
         self.add_page()
-        self.set_font("Noto", size=12)
         self.set_text_color(30, 30, 30)
-        self.multi_cell(0, 8, text, align="R")
 
-
-def build_pdf(page_texts: list[str], output_path: str, title: str = "") -> None:
-    pdf = ArabicPDF(title=title)
-    for text in page_texts:
         if text and text.strip():
-            pdf.add_translated_page(text)
-    pdf.output(output_path)
+            body_align = "R" if self.rtl else "L"
+            max_w = self.w - self.l_margin - self.r_margin
+            blocks = [b.strip() for b in re.split(r"\n\s*\n", text) if b.strip()]
+            for b in blocks:
+                if b.startswith("##"):
+                    heading = b.lstrip("#").strip()
+                    if heading:
+                        if self.has_bold:
+                            self.set_font(self.font_family, "B", HEADING_FONT_SIZE)
+                        else:
+                            self.set_font(self.font_family, size=HEADING_FONT_SIZE)
+                        self.ln(2)
+                        for line in self._wrap_visual(
+                                self._shape(heading), max_w,
+                                tail_first=self._para_is_rtl(heading, self.rtl)):
+                            self.cell(0, 10, line, align="C",
+                                      new_x="LMARGIN", new_y="NEXT")
+                        self.ln(3)
+                else:
+                    para = re.sub(r"\s*\n\s*", " ", b).strip()
+                    if para:
+                        self.set_font(self.font_family, size=BODY_FONT_SIZE)
+                        for line in self._wrap_visual(
+                                self._shape(para), max_w,
+                                tail_first=self._para_is_rtl(para, self.rtl)):
+                            self.cell(0, BODY_LINE_HEIGHT, line, align=body_align,
+                                      new_x="LMARGIN", new_y="NEXT")
+                        self.ln(PARA_GAP)
+
+        max_w = self.w - 40
+        max_h = self.h - self.b_margin - self.t_margin - 16
+        for img in images or []:
+            usable_h = self.h - 40
+            target_y = 20 + (img.get("rel_top", 1.0) * usable_h)
+            if self.get_y() < target_y:
+                self.ln(target_y - self.get_y())
+            else:
+                self.ln(8)
+            iw, ih = img.get("w", 1), img.get("h", 1)
+            w = min(max_w, 160.0)
+            h = w * ih / max(iw, 1)
+            if h > max_h:
+                h = max_h
+                w = h * iw / max(ih, 1)
+            x = (self.w - w) / 2
+            try:
+                self.image(img["path"], x=x, y=self.get_y(), w=w, h=h)
+            except Exception as e:
+                print(f"    (image skipped: {e})")
+            self.ln(8)
+
+
+def _write_pdf_atomic(pdf: FPDF, target_path: str) -> None:
+    """Write via a .tmp file + atomic replace so an interrupted write
+    never leaves a half-written PDF behind."""
+    target = Path(target_path)
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        pdf.output(str(tmp))
+        os.replace(str(tmp), str(target))
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _increment_path(path: str) -> str:
+    """name.pdf -> name_2.pdf -> name_3.pdf ..."""
+    p = Path(path)
+    m = re.match(r"^(.*)_(\d+)$", p.stem)
+    if m:
+        return str(p.with_name(f"{m.group(1)}_{int(m.group(2)) + 1}{p.suffix}"))
+    return str(p.with_name(f"{p.stem}_2{p.suffix}"))
+
+
+def build_pdf(entries: list[tuple[int, str, list[dict]]], output_path: str,
+              title: str = "", lang: str = DEFAULT_LANG) -> str:
+    """Write the translated book.
+
+    If the target file is locked (open in a viewer, read-only, ...), retries
+    with incremented names (_2, _3, ...). Returns the path actually written.
+    Raises PermissionError only if every variant fails.
+    """
+    target = str(output_path)
+    renamed = False
+    for attempt in range(51):
+        pdf = TranslatedPDF(title=title, lang=lang)
+        for page_number, text, images in entries:
+            if (text and text.strip()) or images:
+                pdf.add_entry(text, page_number=page_number, images=images)
+        try:
+            _write_pdf_atomic(pdf, target)
+            if renamed:
+                print(f"    (target was locked — saved as {target})")
+            return target
+        except PermissionError:
+            renamed = True
+            target = _increment_path(target)
+    raise PermissionError(
+        f"Could not write any variant of {output_path} — "
+        "the file may be open in another program or read-only.")
+
+
+def make_backend(backend: str, api_key: str | None = None, model: str = DEFAULT_MODEL,
+                 temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG,
+                 azure_key: str | None = None, azure_region: str | None = None):
+    if backend == "azure":
+        return AzureBackend(key=azure_key, region=azure_region, lang=lang)
+    if backend == "google-free":
+        return GoogleScrapeBackend(lang=lang)
+    return GeminiBackend(api_key=api_key, model=model, temperature=temperature, lang=lang)
+
+
+def _build_output_pdf(input_path: str, output_path: str, selected: set[int], title: str,
+                      lang: str, log=None) -> tuple[int, int, str]:
+    """Extract images from the source and merge all translated pages into the PDF.
+
+    Works with whatever is in the progress file so far — used both on normal
+    completion and on quota/stop so the PDF is always up to date.
+    Returns (pages_in_output, images_added, actual_output_path).
+    """
+    log = log or (lambda m: print(m, flush=True))
+    tmp_dir = tempfile.mkdtemp(prefix="booktrans_")
+    try:
+        image_map = extract_images(input_path, tmp_dir, page_indices=set(selected))
+        done_map = load_progress(output_path, input_path)
+        page_indices = sorted(set(done_map.keys()) | set(selected))
+        entries = [(i + 1, done_map.get(i, ""), image_map.get(i, [])) for i in page_indices]
+        actual = build_pdf(entries, output_path, title=title, lang=lang)
+        if actual != output_path:
+            log(f"    (target was locked — saved as {actual})")
+        image_count = sum(len(v) for v in image_map.values())
+        rendered = sum(1 for _, text, imgs in entries if text.strip() or imgs)
+        return rendered, image_count, actual
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def looks_truncated(src_len: int, out_text: str) -> bool:
+    """Heuristic: long source but suspiciously short output."""
+    if src_len < COMPLETENESS_MIN_SRC:
+        return False
+    out_len = len((out_text or "").strip())
+    if out_len == 0:
+        return True
+    return (out_len / src_len) < COMPLETENESS_MIN_RATIO
 
 
 def run_translation(
@@ -340,21 +980,27 @@ def run_translation(
     backend: str = "gemini",
     model: str = DEFAULT_MODEL,
     temperature: float = DEFAULT_TEMPERATURE,
+    lang: str = DEFAULT_LANG,
+    azure_key: str | None = None,
+    azure_region: str | None = None,
     pages: str = "",
     title: str = "",
     spacing: float = REQUEST_SPACING,
     resume: bool = True,
+    should_stop=None,
     log_callback=None,
     status_callback=None,
     progress_callback=None,
 ) -> dict:
-    """Translate the whole book. Returns summary dict.
+    """Translate the whole book. Returns a summary dict.
 
-    Raises QuotaExhausted (progress saved) when the daily quota runs out.
+    Raises QuotaExhausted (progress saved) when a quota runs out.
+    Honors should_stop() between pages: partial results are saved to the PDF.
     """
     log = log_callback or (lambda m: print(m, flush=True))
     status = status_callback or (lambda t: None)
     progress = progress_callback or (lambda cur, tot: None)
+    should_stop = should_stop or (lambda: False)
 
     in_path = Path(input_path)
     out_path = Path(output_path)
@@ -363,42 +1009,86 @@ def run_translation(
     if in_path.resolve() == out_path.resolve():
         raise ValueError("Output file must be different from the input file.")
 
-    if backend == "azure":
-        translator = AzureBackend()
-        log("Backend: Azure Translator")
-    else:
-        translator = GeminiBackend(api_key=api_key, model=model, temperature=temperature)
-        log(f"Backend: Gemini ({model})")
+    translator = make_backend(backend, api_key, model, temperature, lang, azure_key, azure_region)
+    log(f"Backend: {backend}" + (f" ({model})" if backend == "gemini" else "") + f" | Language: {LANGUAGES.get(lang, lang)}")
 
     status("Extracting text...")
     log(f"Extracting text from: {in_path.name}")
     all_pages = extract_text_from_pdf(str(in_path))
     selected = parse_pages(pages, len(all_pages))
     target = [i for i in sorted(selected) if all_pages[i].strip()]
+    image_only = [i for i in sorted(selected) if not all_pages[i].strip()]
 
     for i, t in enumerate(all_pages):
         if not t.strip():
-            log(f"  Page {i + 1}: no extractable text (image-only?), skipped.")
+            log(f"  Page {i + 1}: no extractable text (image-only?), skipped for text.")
 
-    already_done = {}
+    already_done: dict[int, str] = {}
+    already_rechecked: set[int] = set()
     prog_file = progress_path_for(str(out_path))
-    if resume and prog_file.exists():
-        already_done = load_progress(str(out_path), str(in_path))
-        if not already_done:
-            log("Ignoring saved progress: it belongs to a different book.")
-    if not already_done:
+    loaded_recs = load_progress_records(str(out_path), str(in_path)) if (resume and prog_file.exists()) else []
+    if resume and prog_file.exists() and not loaded_recs:
+        log("Ignoring saved progress: it belongs to a different book.")
+    for rec in loaded_recs:
+        idx = rec["page"]
+        if idx < 0 or idx >= len(all_pages):
+            continue
+        txt = rec.get("text", "")
+        if rec.get("rechecked"):
+            already_rechecked.add(idx)
+        # Drop poisoned empties: no text recorded but the source has text.
+        # These came from interrupted runs and must be retranslated.
+        if not txt.strip() and all_pages[idx].strip():
+            continue
+        already_done[idx] = txt
+    if not already_done and not already_rechecked:
         if prog_file.exists():
             clear_progress(str(out_path))
         init_progress(str(out_path), str(in_path))
 
+    # Auto-repair: previously recorded pages that look truncated go back
+    # to the todo list (once — results are marked rechecked to avoid loops).
+    recheck_todo = []
+    for idx, txt in list(already_done.items()):
+        if idx in already_rechecked:
+            continue
+        if looks_truncated(len(clean_page_text(all_pages[idx])), txt):
+            recheck_todo.append(idx)
+    if recheck_todo:
+        log(f"Rechecking {len(recheck_todo)} previously truncated page(s): "
+            + ", ".join(str(i + 1) for i in sorted(recheck_todo)))
+        for idx in recheck_todo:
+            del already_done[idx]
+    recheck_ids = set(recheck_todo)
+
     todo = [i for i in target if i not in already_done]
-    log(f"Model: {model} | Pages selected: {len(target)} | Already done: {len(target) - len(todo)} | Remaining: {len(todo)}")
+    log(f"Pages selected: {len(target)} | Already done: {len(target) - len(todo)} | Remaining: {len(todo)}")
+
+    glossary: dict[str, str] = {}
+    if backend == "gemini" and todo:
+        status("Building name glossary...")
+        log("Building name glossary (one request)...")
+        glossary = build_glossary(all_pages, translator, lang, log)
+
+    # Seed context from the previously translated page when resuming,
+    # so the first new page keeps consistent names too.
+    prev_translation = ""
+    if todo:
+        prev_done = already_done.get(todo[0] - 1, "")
+        if prev_done.strip():
+            prev_translation = prev_done.strip()[-CONTEXT_TAIL_CHARS:]
 
     total = len(target)
     done_count = total - len(todo)
     start_time = time.time()
+    stopped = False
 
     for n, page_idx in enumerate(todo, start=1):
+        if should_stop():
+            stopped = True
+            log("Stop requested — saving what we have.")
+            break
+
         status(f"Translating page {page_idx + 1} ({done_count + n}/{total})...")
         progress(done_count + n, total)
         log(f"Translating page {page_idx + 1}/{len(all_pages)}...")
@@ -409,63 +1099,128 @@ def run_translation(
             continue
 
         t0 = time.time()
+        needs_flag = page_idx in recheck_ids
         try:
-            arabic = translator.translate_page(all_pages[page_idx], log=log)
-        except QuotaExhausted as e:
-            append_progress(str(out_path), page_idx, "")
-            log(f"\nDaily quota exhausted at page {page_idx + 1}. Progress saved.")
-            log("Re-run this same command after the quota resets (midnight Pacific) to continue.")
-            raise QuotaExhausted(str(e)) from e
+            arabic = translator.translate_page(
+                all_pages[page_idx], log=log,
+                context=prev_translation or None,
+                glossary=glossary or None,
+            )
+            if looks_truncated(len(cleaned), arabic) and not needs_flag:
+                log(f"    WARNING: page {page_idx + 1} looks truncated "
+                    f"({len(arabic.strip())} vs {len(cleaned)} source chars) — retrying once...")
+                arabic = translator.translate_page(
+                    all_pages[page_idx], log=log,
+                    context=prev_translation or None,
+                    glossary=glossary or None,
+                )
+                if looks_truncated(len(cleaned), arabic):
+                    log("    Still short — keeping it, flagged for review.")
+                    needs_flag = True
+                else:
+                    log("    Retry produced a complete page.")
+        except (QuotaExhausted, TransientFailure) as e:
+            kind = "Quota exhausted" if isinstance(e, QuotaExhausted) else "Model overloaded"
+            hint = ("Re-run this same command after the quota resets — "
+                    if isinstance(e, QuotaExhausted) else
+                    "Wait a few minutes and re-run — ")
+            log(f"\n{kind} at page {page_idx + 1}.")
+            log("Merging translated pages into the PDF now...")
+            status("Merging progress into PDF...")
+            pages_done, imgs, actual = _build_output_pdf(
+                str(in_path), str(out_path), selected, title, lang, log)
+            log(f"Partial PDF saved: {actual} ({pages_done} pages, {imgs} images)")
+            log(hint + "already-translated pages are skipped automatically.")
+            raise
 
-        append_progress(str(out_path), page_idx, arabic)
+        append_progress(str(out_path), page_idx, arabic, rechecked=needs_flag)
+        if arabic.strip():
+            prev_translation = arabic.strip()[-CONTEXT_TAIL_CHARS:]
         dt = time.time() - t0
         remaining = len(todo) - n
         eta = (dt + spacing) * remaining
         log(f"    Page {page_idx + 1} done in {dt:.1f}s | ETA: {eta / 60:.1f} min")
 
-        if n < len(todo):
+        if n < len(todo) and not should_stop():
             time.sleep(spacing)
 
     progress(total, total)
-    status("Building PDF...")
-    done_map = load_progress(str(out_path), str(in_path))
-    page_indices = sorted(set(done_map.keys()) | selected)
-    page_texts = [done_map.get(i, "") for i in page_indices]
-    build_pdf(page_texts, str(out_path), title=title)
+    status("Extracting images + building PDF...")
+    log("Extracting images from source PDF and building the PDF...")
+    pages_done, images_added, actual_path = _build_output_pdf(
+        str(in_path), str(out_path), selected, title, lang, log)
 
     elapsed = time.time() - start_time
-    log(f"\nDone! Output saved to: {out_path}")
-    log(f"Pages translated: {sum(1 for t in page_texts if t.strip())} | New pages this run: {len(todo)} | Time: {elapsed / 60:.1f} min")
-    log("Progress file kept — re-run with more pages later to extend this same PDF.")
-    return {"total": total, "new": len(todo), "output": str(out_path)}
+    log(f"\nDone! Output saved to: {actual_path}")
+    log(f"Pages in output: {pages_done} | New pages this run: {len(todo)} | Images added: {images_added} | Time: {elapsed / 60:.1f} min")
+    if stopped:
+        log("Stopped by user — progress file kept. Re-run with the same settings to continue.")
+    else:
+        log("Progress file kept — re-run with more pages later to extend this same PDF.")
+    return {
+        "total": total,
+        "new": len(todo),
+        "stopped": stopped,
+        "output": actual_path,
+        "pages_in_output": pages_done,
+        "images": images_added,
+    }
 
 
 def test_one_page(input_path: str, page_number: int = 1, api_key: str | None = None,
-                  backend: str = "gemini",
-                  model: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE) -> tuple[str, str]:
-    """Translate a single page for quality testing. Returns (english, arabic)."""
+                  backend: str = "gemini", lang: str = DEFAULT_LANG,
+                  model: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE,
+                  azure_key: str | None = None, azure_region: str | None = None) -> tuple[str, str]:
+    """Translate a single page for quality testing. Returns (english, translation)."""
     pages = extract_text_from_pdf(input_path)
     if not 1 <= page_number <= len(pages):
         raise ValueError(f"Page {page_number} out of range (book has {len(pages)} pages)")
     english = clean_page_text(pages[page_number - 1])
-    if backend == "azure":
-        translator = AzureBackend()
-    else:
-        translator = GeminiBackend(api_key=api_key, model=model, temperature=temperature)
-    arabic = translator.translate_page(pages[page_number - 1])
-    return english, arabic
+    translator = make_backend(backend, api_key, model, temperature, lang, azure_key, azure_region)
+    translated = translator.translate_page(pages[page_number - 1])
+    return english, translated
+
+
+def merge_progress_to_pdf(input_path: str, output_path: str, title: str = "",
+                          lang: str = DEFAULT_LANG) -> tuple[int, int, str]:
+    """Merge all pages recorded in the progress file into the output PDF.
+
+    Independent of a translation run — used by the GUI's
+    "Save progress to PDF" button. Returns (pages, images, actual_path).
+    """
+    in_path = Path(input_path)
+    if not in_path.exists():
+        raise FileNotFoundError(f"File not found: {input_path}")
+
+    prog_file = progress_path_for(output_path)
+    done = load_progress(output_path, str(in_path))
+    if not prog_file.exists() or not done:
+        raise ValueError("No saved progress found for this output. Translate some pages first.")
+
+    selected = set(done.keys())
+    tmp_dir = tempfile.mkdtemp(prefix="booktrans_")
+    try:
+        image_map = extract_images(str(in_path), tmp_dir, page_indices=selected)
+        entries = [(i + 1, done.get(i, ""), image_map.get(i, [])) for i in sorted(selected)]
+        actual = build_pdf(entries, output_path, title=title, lang=lang)
+        rendered = sum(1 for _, text, imgs in entries if text.strip() or imgs)
+        images = sum(len(v) for v in image_map.values())
+        return rendered, images, actual
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate a PDF book to Arabic with Gemini")
+    parser = argparse.ArgumentParser(description="Translate a PDF book")
     parser.add_argument("--input", "-i", required=True, help="Input PDF path")
     parser.add_argument("--output", "-o", default="translated.pdf", help="Output PDF path")
     parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    parser.add_argument("--lang", "-l", choices=list(LANGUAGES), default=DEFAULT_LANG, help="Target language (default: ar)")
     parser.add_argument("--pages", "-p", type=str, default="", help="Page range, e.g. '20-44' or '1,3,5-8'")
     parser.add_argument("--title", "-t", type=str, default="", help="Book title for header")
     parser.add_argument("--spacing", type=float, default=REQUEST_SPACING, help="Seconds between requests (default: 4)")
-    parser.add_argument("--backend", "-b", choices=["gemini", "azure"], default="gemini", help="Translation backend (default: gemini)")
+    parser.add_argument("--backend", "-b", choices=["gemini", "azure", "google-free"], default="gemini")
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start over")
     args = parser.parse_args()
 
@@ -476,6 +1231,7 @@ def main():
             backend=args.backend,
             model=args.model,
             temperature=args.temperature,
+            lang=args.lang,
             pages=args.pages,
             title=args.title,
             spacing=args.spacing,
@@ -483,6 +1239,8 @@ def main():
         )
     except QuotaExhausted:
         sys.exit(2)
+    except TransientFailure:
+        sys.exit(3)
     except (ValueError, FileNotFoundError) as e:
         print(f"Error: {e}")
         sys.exit(1)

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Book Translator GUI - Gemini edition
-Drag & drop a PDF -> full-page translation into Arabic -> RTL PDF
+Book Translator GUI
+Drag & drop a PDF -> whole-page translation (Gemini / Azure / Google-free)
+-> RTL Arabic PDF (also French / English), images kept, original page numbers.
 """
 
 import os
@@ -23,15 +24,17 @@ MODEL_OPTIONS = [
     "gemini-3.8-flash",
     "gemini-2.5-flash",
 ]
+BACKENDS = ["gemini", "azure", "google-free"]
+LANG_NAMES = {"ar": "Arabic", "fr": "French", "en": "English"}
+LANG_LABELS = [f"{name} ({code})" for code, name in LANG_NAMES.items()]
 
 
 class App(TkinterDnD.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Book Translator - Gemini")
-        self.geometry("720x660")
-        self.minsize(640, 600)
-        self.resizable(True, True)
+        self.title("Book Translator")
+        self.geometry("760x820")
+        self.minsize(700, 760)
         self.configure(bg="#1e1e2e")
 
         self.pdf_path = tk.StringVar()
@@ -41,15 +44,41 @@ class App(TkinterDnD.Tk):
         self.model_var = tk.StringVar(value=tb.DEFAULT_MODEL)
         self.temp_var = tk.StringVar(value=str(tb.DEFAULT_TEMPERATURE))
         self.backend_var = tk.StringVar(value="gemini")
+        self.lang_var = tk.StringVar(value="Arabic (ar)")
 
         self.is_running = False
+        self.stop_event = threading.Event()
+        self.page_count = 0
+        self.vt_stats = None
+
+        self._set_icon()
         self._build_ui()
+
+    # ---------- setup ----------
+
+    def _set_icon(self):
+        candidates = []
+        if getattr(sys, "frozen", False):
+            candidates.append(Path(sys.executable).parent / "book_trans.ico")
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                candidates.append(Path(meipass) / "book_trans.ico")
+        else:
+            candidates.append(Path(__file__).parent / "book_trans.ico")
+        for c in candidates:
+            if c.exists():
+                try:
+                    self.iconbitmap(str(c))
+                except Exception:
+                    pass
+                break
 
     def _build_ui(self):
         BG = "#1e1e2e"
         FG = "#cdd6f4"
         ACCENT = "#89b4fa"
         GREEN = "#a6e3a1"
+        RED = "#f38ba8"
         ENTRY_BG = "#313244"
         SUBTLE = "#6c7086"
 
@@ -60,20 +89,17 @@ class App(TkinterDnD.Tk):
         tk.Label(
             self, text="Book Translator", font=("Segoe UI", 18, "bold"),
             bg=BG, fg=FG,
-        ).pack(pady=(16, 2))
+        ).pack(pady=(14, 2))
         tk.Label(
-            self, text="PDF  →  Arabic  ·  full-page translation with Gemini",
+            self, text="PDF  →  full-page translation  ·  images kept  ·  original page numbers",
             font=("Segoe UI", 9), bg=BG, fg=SUBTLE,
         ).pack()
 
-        # API key status
-        key_found = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-        key_text = "✓ Gemini API key found in environment" if key_found else "⚠ No API key — set GEMINI_API_KEY (aistudio.google.com/apikey)"
-        key_color = GREEN if key_found else "#f9e2af"
-        tk.Label(self, text=key_text, font=("Segoe UI", 9), bg=BG, fg=key_color).pack(pady=(6, 0))
+        self.key_label = tk.Label(self, text="", font=("Segoe UI", 9), bg=BG, fg=GREEN)
+        self.key_label.pack(pady=(4, 0))
 
-        drop = tk.Frame(self, bg=ENTRY_BG, highlightbackground=ACCENT, highlightthickness=1, height=72)
-        drop.pack(fill="x", padx=30, pady=(10, 4))
+        drop = tk.Frame(self, bg=ENTRY_BG, highlightbackground=ACCENT, highlightthickness=1, height=66)
+        drop.pack(fill="x", padx=28, pady=(8, 4))
         drop.pack_propagate(False)
         drop.drop_target_register(DND_FILES)
         drop.dnd_bind("<<Drop>>", self.on_drop)
@@ -89,24 +115,29 @@ class App(TkinterDnD.Tk):
             self, text="Browse...", command=self.browse_file,
             bg=ACCENT, fg=BG, font=("Segoe UI", 9, "bold"),
             relief="flat", padx=16, pady=3, cursor="hand2",
-        ).pack(pady=(4, 8))
+        ).pack(pady=(4, 6))
+
+        self.vt_label = tk.Label(self, text="VirusTotal: —", font=("Segoe UI", 8),
+                                 bg=BG, fg=SUBTLE, cursor="hand2")
+        self.vt_label.pack()
+        self.vt_label.bind("<Button-1>", lambda e: self._rescan())
 
         form = tk.Frame(self, bg=BG)
-        form.pack(fill="x", padx=30)
+        form.pack(fill="x", padx=28)
 
-        rows = [
-            ("Output name:", self.output_name),
-            ("Pages:", self.pages_str),
-            ("Book title:", self.title_str),
-        ]
-        for label_text, var in rows:
+        def entry_row(label, var, width=16):
             row = tk.Frame(form, bg=BG)
             row.pack(fill="x", pady=3)
-            tk.Label(row, text=label_text, width=16, anchor="w", bg=BG, fg=FG,
+            tk.Label(row, text=label, width=width, anchor="w", bg=BG, fg=FG,
                      font=("Segoe UI", 10)).pack(side="left")
             tk.Entry(row, textvariable=var, bg=ENTRY_BG, fg=FG,
                      insertbackground=FG, relief="flat", font=("Segoe UI", 10)).pack(
                 side="left", fill="x", expand=True, ipady=3)
+            return row
+
+        entry_row("Output name:", self.output_name)
+        entry_row("Pages:", self.pages_str)
+        entry_row("Book title:", self.title_str)
 
         tk.Label(
             form, text="leave empty = whole book   ·   40 = one page   ·   1-40 or 60-80 = range   ·   40,60-62 = mix",
@@ -117,19 +148,25 @@ class App(TkinterDnD.Tk):
         row.pack(fill="x", pady=3)
         tk.Label(row, text="Backend:", width=16, anchor="w", bg=BG, fg=FG,
                  font=("Segoe UI", 10)).pack(side="left")
-        backend_menu = ttk.Combobox(
-            row, textvariable=self.backend_var, state="readonly",
-            values=["gemini", "azure"], font=("Segoe UI", 10))
+        backend_menu = ttk.Combobox(row, textvariable=self.backend_var, state="readonly",
+                                    values=BACKENDS, font=("Segoe UI", 10))
         backend_menu.pack(side="left", fill="x", expand=True)
         backend_menu.bind("<<ComboboxSelected>>", lambda e: self._on_backend_change())
 
+        row = tk.Frame(form, bg=BG)
+        row.pack(fill="x", pady=3)
+        tk.Label(row, text="Language:", width=16, anchor="w", bg=BG, fg=FG,
+                 font=("Segoe UI", 10)).pack(side="left")
+        ttk.Combobox(row, textvariable=self.lang_var, state="readonly",
+                     values=LANG_LABELS, font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
+
+        # gemini-only rows
         self.model_row = tk.Frame(form, bg=BG)
         self.model_row.pack(fill="x", pady=3)
         tk.Label(self.model_row, text="Model:", width=16, anchor="w", bg=BG, fg=FG,
                  font=("Segoe UI", 10)).pack(side="left")
-        model_menu = ttk.Combobox(self.model_row, textvariable=self.model_var, values=MODEL_OPTIONS,
-                                  font=("Segoe UI", 10))
-        model_menu.pack(side="left", fill="x", expand=True)
+        ttk.Combobox(self.model_row, textvariable=self.model_var, values=MODEL_OPTIONS,
+                     font=("Segoe UI", 10)).pack(side="left", fill="x", expand=True)
 
         self.temp_row = tk.Frame(form, bg=BG)
         self.temp_row.pack(fill="x", pady=3)
@@ -137,28 +174,68 @@ class App(TkinterDnD.Tk):
                  font=("Segoe UI", 10)).pack(side="left")
         tk.Entry(self.temp_row, textvariable=self.temp_var, bg=ENTRY_BG, fg=FG,
                  insertbackground=FG, relief="flat", font=("Segoe UI", 10), width=8).pack(side="left")
+        tk.Label(self.temp_row, text="0 = literal · 0.6 = balanced · 1 = creative",
+                 font=("Segoe UI", 8), bg=BG, fg=SUBTLE).pack(side="left", padx=(10, 0))
 
         buttons = tk.Frame(self, bg=BG)
-        buttons.pack(fill="x", padx=30, pady=(12, 6))
+        buttons.pack(fill="x", padx=28, pady=(10, 6))
 
         self.btn = tk.Button(
             buttons, text="Translate", command=self.start_translation,
             bg=GREEN, fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
             relief="flat", pady=6, cursor="hand2", activebackground="#94e2d5",
         )
-        self.btn.pack(fill="x")
+        self.btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+
+        self.stop_btn = tk.Button(
+            buttons, text="Stop & Save", command=self.request_stop,
+            bg=RED, fg="#1e1e2e", font=("Segoe UI", 11, "bold"),
+            relief="flat", pady=6, cursor="hand2", state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=(4, 4))
+
+        self.save_btn = tk.Button(
+            buttons, text="Save progress\n& PDF", command=self.save_progress_to_pdf,
+            bg=ENTRY_BG, fg=FG, font=("Segoe UI", 9),
+            relief="flat", pady=4, cursor="hand2",
+        )
+        self.save_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         self.progress = ttk.Progressbar(self, mode="determinate")
-        self.progress.pack(fill="x", padx=30)
+        self.progress.pack(fill="x", padx=28)
 
         self.status = tk.Label(self, text="Ready", font=("Segoe UI", 9), bg=BG, fg=SUBTLE)
         self.status.pack(pady=(4, 0))
 
-        self.log_text = tk.Text(self, height=7, bg=ENTRY_BG, fg=FG,
-                                relief="flat", font=("Consolas", 8), state="disabled")
-        self.log_text.pack(fill="both", expand=True, padx=30, pady=(6, 12))
+        self.log_text = tk.Text(self, height=12, bg=ENTRY_BG, fg=FG,
+                                relief="flat", font=("Consolas", 9), state="disabled")
+        self.log_text.pack(fill="both", expand=True, padx=28, pady=(4, 8))
+
+        self._refresh_key_status()
 
     # ---------- helpers ----------
+
+    def _lang_code(self) -> str:
+        label = self.lang_var.get()
+        for code, name in LANG_NAMES.items():
+            if label.startswith(name):
+                return code
+        return tb.DEFAULT_LANG
+
+    def _refresh_key_status(self):
+        backend = self.backend_var.get()
+        GREEN = "#a6e3a1"
+        WARN = "#f9e2af"
+        if backend == "gemini":
+            found = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+            text = "✓ Gemini key found in environment/.env" if found else "⚠ No Gemini key — set GEMINI_API_KEY or add .env"
+        elif backend == "azure":
+            found = bool(os.environ.get("AZURE_TRANSLATOR_KEY"))
+            text = "✓ Azure key found in environment/.env" if found else "⚠ No Azure key — set AZURE_TRANSLATOR_KEY or add .env"
+        else:
+            found = True
+            text = "✓ Google-free needs no key"
+        self.key_label.config(text=text, fg=GREEN if found else WARN)
 
     def browse_file(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -175,7 +252,57 @@ class App(TkinterDnD.Tk):
     def set_pdf(self, path):
         self.pdf_path.set(path)
         self.output_name.set(Path(path).stem + "_translated")
-        self.drop_label.config(text=Path(path).name, fg="#cdd6f4")
+        self.drop_label.config(text=f"{Path(path).name}  (counting pages...)",
+                               fg="#cdd6f4")
+        self.page_count = 0
+        self.vt_stats = None
+        self.vt_label.config(text="VirusTotal: scanning...", fg="#89b4fa")
+        threading.Thread(target=self._book_info_worker, args=(path,), daemon=True).start()
+
+    def _book_info_worker(self, path):
+        pages = 0
+        try:
+            pages = tb.count_pages(path)
+        except Exception:
+            pages = 0
+
+        def upd():
+            name = Path(path).name
+            if pages:
+                self.drop_label.config(text=f"{name}  ({pages} pages)")
+            else:
+                self.drop_label.config(text=name)
+        self.after(0, upd)
+
+        result = tb.vt_scan_file(path)
+        stats = result.get("stats")
+
+        def vt_upd():
+            if result.get("error") == "no key":
+                self.vt_label.config(text="VirusTotal: no key (skipped)", fg="#6c7086")
+                self.vt_stats = None
+            elif result.get("error"):
+                self.vt_label.config(text=f"VirusTotal: error ({result['error'][:40]})", fg="#f9e2af")
+                self.vt_stats = None
+            else:
+                flagged = (stats.get("malicious", 0) or 0) + (stats.get("suspicious", 0) or 0)
+                total = sum(stats.values()) if stats else 0
+                self.vt_stats = stats
+                if flagged:
+                    self.vt_label.config(
+                        text=f"VirusTotal: ⚠ {flagged} of {total} engines flagged — click to re-scan",
+                        fg="#f38ba8")
+                else:
+                    self.vt_label.config(
+                        text=f"VirusTotal: ✓ clean ({total} engines)", fg="#a6e3a1")
+        self.after(0, vt_upd)
+
+    def _rescan(self):
+        path = self.pdf_path.get()
+        if not path or not Path(path).exists():
+            return
+        self.vt_label.config(text="VirusTotal: re-scanning...", fg="#89b4fa")
+        threading.Thread(target=self._book_info_worker, args=(path,), daemon=True).start()
 
     def output_path_for(self) -> str:
         out_name = self.output_name.get().strip() or "translated"
@@ -205,19 +332,20 @@ class App(TkinterDnD.Tk):
         self.is_running = running
         state = "disabled" if running else "normal"
         self.btn.config(state=state)
+        self.save_btn.config(state=state)
+        self.stop_btn.config(state="normal" if running else "disabled")
         color = "#f38ba8" if running else "#a6e3a1"
         self.btn.config(bg=color)
 
     def _on_backend_change(self):
-        if self.backend_var.get() == "azure":
+        backend = self.backend_var.get()
+        if backend == "gemini":
+            self.model_row.pack(fill="x", pady=3)
+            self.temp_row.pack(fill="x", pady=3)
+        else:
             self.model_row.pack_forget()
             self.temp_row.pack_forget()
-        else:
-            self._show_gemini_rows()
-
-    def _show_gemini_rows(self):
-        self.model_row.pack(fill="x", pady=3)
-        self.temp_row.pack(fill="x", pady=3)
+        self._refresh_key_status()
 
     def _validate(self) -> bool:
         input_path = self.pdf_path.get()
@@ -236,12 +364,46 @@ class App(TkinterDnD.Tk):
 
     # ---------- actions ----------
 
+    def request_stop(self):
+        if not self.is_running:
+            return
+        self.stop_event.set()
+        self.set_status("Stopping after this page...")
+        self.log("Stop requested — finishing current page, then saving.")
+
+    def save_progress_to_pdf(self):
+        if self.is_running:
+            return
+        if not self._validate():
+            return
+        path = self.pdf_path.get()
+        out = self.output_path_for()
+        try:
+            pages, images, actual = tb.merge_progress_to_pdf(
+                path, out, title=self.title_str.get().strip(), lang=self._lang_code())
+        except Exception as e:
+            messagebox.showerror("Cannot merge", str(e))
+            return
+        self.log(f"Merged progress into {actual} ({pages} pages, {images} images)")
+        messagebox.showinfo(
+            "Saved",
+            f"Progress merged into the PDF:\n\n{actual}\n\n{pages} pages · {images} images")
+
     def start_translation(self):
         if self.is_running or not self._validate():
             return
         model, temp = self._model_and_temp()
-        if not model:
+        if not model or temp is None:
             return
+
+        if self.vt_stats:
+            flagged = self.vt_stats.get("malicious", 0) + self.vt_stats.get("suspicious", 0)
+            if flagged > 0:
+                go = messagebox.askyesno(
+                    "VirusTotal warning",
+                    f"{flagged} security engines flagged this file.\n\nTranslate it anyway?")
+                if not go:
+                    return
 
         input_path = self.pdf_path.get()
         output_path = self.output_path_for()
@@ -259,6 +421,7 @@ class App(TkinterDnD.Tk):
                     "Yes = skip translated pages and extend this PDF\n"
                     "No = start over from page 1")
 
+        self.stop_event.clear()
         self.set_running(True)
         self.set_status("Starting...")
         self.progress["value"] = 0
@@ -275,28 +438,47 @@ class App(TkinterDnD.Tk):
 
     def _run_worker(self, input_path, output_path, model, temp, pages, title, resume):
         try:
-            tb.run_translation(
+            summary = tb.run_translation(
                 input_path=input_path,
                 output_path=output_path,
                 backend=self.backend_var.get(),
                 model=model,
                 temperature=temp,
+                lang=self._lang_code(),
                 pages=pages,
                 title=title,
                 resume=resume,
+                should_stop=self.stop_event.is_set,
                 progress_callback=self.set_progress,
                 status_callback=self.set_status,
                 log_callback=self.log,
             )
-            self.after(0, lambda: messagebox.showinfo(
-                "Done", f"Translation complete!\n\nSaved to:\n{output_path}"))
+            if summary.get("stopped"):
+                self.after(0, lambda: messagebox.showinfo(
+                    "Stopped & saved",
+                    f"Stopped. {summary.get('pages_in_output', 0)} pages are already in:\n{output_path}\n\n"
+                    "Re-run with the same settings to continue."))
+            else:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Done",
+                    f"Translation complete!\n\n{summary.get('pages_in_output', 0)} pages · "
+                    f"{summary.get('images', 0)} images\nSaved to:\n{output_path}"))
         except tb.QuotaExhausted:
             self.after(0, lambda: messagebox.showwarning(
-                "Daily quota reached",
+                "Daily quota reached — partial PDF saved",
                 "Gemini free-tier quota is exhausted.\n\n"
-                "All pages translated so far are saved.\n"
-                "Re-run tomorrow after midnight (Pacific time) to continue —\n"
-                "the app will resume automatically."))
+                "Everything translated so far has been merged into the PDF already.\n"
+                "Re-run tomorrow after midnight (Pacific) to continue —\n"
+                "translated pages are skipped automatically."))
+        except tb.TransientFailure:
+            self.after(0, lambda: messagebox.showwarning(
+                "Model overloaded — partial PDF saved",
+                "The model is under heavy load and stayed unavailable after retries.\n\n"
+                "Everything translated so far has been merged into the PDF already.\n"
+                "Wait a few minutes and re-run to continue —\n"
+                "translated pages are skipped automatically.\n\n"
+                "Tip: switching the Model dropdown to another model can help,\n"
+                "since overloads often affect one model at a time."))
         except Exception as e:
             self.log(traceback.format_exc())
             self.after(0, lambda: messagebox.showerror("Error", str(e)))

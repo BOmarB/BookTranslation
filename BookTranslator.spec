@@ -2,14 +2,19 @@
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
-datas = []
+datas = [('book_trans.ico', '.'), ('fonts', 'fonts')]
 binaries = []
-hiddenimports = ['uharfbuzz']
+hiddenimports = []
 hiddenimports += collect_submodules('google.auth')
 hiddenimports += collect_submodules('google.api')
+hiddenimports += collect_submodules('PIL')
 tmp_ret = collect_all('tkinterdnd2')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('google.genai')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('translators')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('cloudscraper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
@@ -22,7 +27,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['google.cloud', 'google.genai.tests', 'torch', 'torchvision', 'torchaudio', 'tensorflow', 'keras', 'scipy', 'matplotlib', 'sklearn', 'pandas', 'nltk', 'sqlalchemy', 'transformers', 'onnxruntime', 'cv2', 'av', 'librosa', 'soundfile', 'yt_dlp', 'yt_dlp_ejs', 'lightning', 'rich', 'numba', 'pygments', 'jinja2', 'mako', 'grpc', 'translators'],
+    excludes=['google.cloud', 'google.genai.tests', 'torch', 'torchvision', 'torchaudio', 'tensorflow', 'keras', 'scipy', 'matplotlib', 'sklearn', 'pandas', 'nltk', 'sqlalchemy', 'transformers', 'onnxruntime', 'cv2', 'av', 'librosa', 'soundfile', 'yt_dlp', 'yt_dlp_ejs', 'lightning', 'rich', 'numba', 'pygments', 'jinja2', 'mako', 'grpc'],
     noarchive=False,
     optimize=0,
 )
@@ -47,4 +52,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=['book_trans.ico'],
 )
