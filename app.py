@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Book Translator GUI
-Drag & drop a PDF -> whole-page translation (Gemini / Azure / Google-free)
+Drag & drop a PDF -> whole-page translation (Gemini / NVIDIA / custom API)
 -> RTL Arabic PDF (also French / English), images kept, original page numbers.
 """
 
@@ -28,10 +28,20 @@ MODEL_OPTIONS = {
     "nvidia": [
         "meta/muse-glimmer-30b",
     ],
+    "custom": [],
 }
-BACKENDS = ["gemini", "azure", "nvidia", "google-free"]
+BACKENDS = ["gemini", "nvidia", "custom"]
 LANG_NAMES = {"ar": "Arabic", "fr": "French", "en": "English"}
 LANG_LABELS = [f"{name} ({code})" for code, name in LANG_NAMES.items()]
+
+# UI palette (module level so dialogs created outside _build_ui can use it).
+BG = "#1e1e2e"
+FG = "#cdd6f4"
+ACCENT = "#89b4fa"
+GREEN = "#a6e3a1"
+RED = "#f38ba8"
+ENTRY_BG = "#313244"
+SUBTLE = "#6c7086"
 
 
 class App(TkinterDnD.Tk):
@@ -168,6 +178,9 @@ class App(TkinterDnD.Tk):
                                     values=BACKENDS, font=("Segoe UI", 9))
         backend_menu.pack(side="left", fill="x", expand=True)
         backend_menu.bind("<<ComboboxSelected>>", lambda e: self._on_backend_change())
+        tk.Button(row, text="Connect…", command=self._open_connect,
+                  bg=ENTRY_BG, fg=FG, font=("Segoe UI", 8), relief="flat",
+                  padx=6, pady=1, cursor="hand2").pack(side="left", padx=(6, 0))
 
         row = tk.Frame(form, bg=BG)
         row.pack(fill="x", pady=1)
@@ -252,17 +265,114 @@ class App(TkinterDnD.Tk):
         WARN = "#f9e2af"
         if backend == "gemini":
             found = bool(os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
-            text = "✓ Gemini key found in environment/.env" if found else "⚠ No Gemini key — set GEMINI_API_KEY or add .env"
-        elif backend == "azure":
-            found = bool(os.environ.get("AZURE_TRANSLATOR_KEY"))
-            text = "✓ Azure key found in environment/.env" if found else "⚠ No Azure key — set AZURE_TRANSLATOR_KEY or add .env"
+            text = "✓ Gemini key found — click Connect… to change it" if found else "⚠ No Gemini key — click Connect… to add one"
         elif backend == "nvidia":
             found = bool(os.environ.get("NVIDIA_API_KEY"))
-            text = "✓ NVIDIA key found in environment/.env" if found else "⚠ No NVIDIA key — set NVIDIA_API_KEY or add .env"
-        else:
-            found = True
-            text = "✓ Google-free needs no key"
+            text = "✓ NVIDIA key found — click Connect… to change it" if found else "⚠ No NVIDIA key — click Connect… to add one"
+        else:  # custom
+            base = os.environ.get("CUSTOM_BASE_URL")
+            key = os.environ.get("CUSTOM_API_KEY")
+            found = bool(base)
+            if base and key:
+                text = f"✓ Custom endpoint: {base}"
+            elif base:
+                text = f"✓ Custom endpoint: {base} (no key — fine for local servers)"
+            else:
+                text = "⚠ No custom endpoint — click Connect… to set the base URL + key"
         self.key_label.config(text=text, fg=GREEN if found else WARN)
+
+    def _open_connect(self):
+        backend = self.backend_var.get()
+        win = tk.Toplevel(self)
+        win.title("Connect — " + {"gemini": "Gemini", "nvidia": "NVIDIA"}.get(backend, "Custom API"))
+        win.configure(bg=BG)
+        win.resizable(False, False)
+        win.transient(self)
+        body = tk.Frame(win, bg=BG)
+        body.pack(padx=16, pady=14, fill="x")
+        entries: dict[str, tk.Entry] = {}
+
+        def add_field(key: str, label: str, hint: str = ""):
+            tk.Label(body, text=label, anchor="w", bg=BG, fg=FG,
+                     font=("Segoe UI", 9, "bold")).pack(fill="x", pady=(6, 1))
+            e = tk.Entry(body, bg=ENTRY_BG, fg=FG, insertbackground=FG,
+                         relief="flat", font=("Segoe UI", 9), width=52)
+            e.insert(0, os.environ.get(key, ""))
+            e.pack(fill="x", ipady=3)
+            if hint:
+                tk.Label(body, text=hint, anchor="w", bg=BG, fg=SUBTLE,
+                         font=("Segoe UI", 7)).pack(fill="x")
+            entries[key] = e
+
+        if backend == "gemini":
+            add_field("GEMINI_API_KEY", "Gemini API key",
+                      "Free key: aistudio.google.com → Get API key")
+        elif backend == "nvidia":
+            add_field("NVIDIA_API_KEY", "NVIDIA API key",
+                      "Free key: build.nvidia.com (model meta/muse-glimmer-30b)")
+        else:
+            add_field("CUSTOM_BASE_URL", "API base URL",
+                      "e.g. https://api.openai.com/v1 · https://openrouter.ai/api/v1 · "
+                      "http://localhost:11434/v1 (Ollama)")
+            add_field("CUSTOM_API_KEY", "API key",
+                      "Leave empty for local servers that need no key")
+
+        tk.Label(body, text=f"Saved to: {self._env_path()}", anchor="w", bg=BG,
+                 fg=SUBTLE, font=("Segoe UI", 7)).pack(fill="x", pady=(10, 0))
+
+        def save():
+            pairs = {k: e.get().strip() for k, e in entries.items() if e.get().strip()}
+            if backend == "custom" and not pairs.get("CUSTOM_BASE_URL"):
+                messagebox.showerror("Missing base URL",
+                                     "Enter your API base URL first.", parent=win)
+                return
+            if backend != "custom" and not pairs:
+                messagebox.showerror("Missing key", "Enter the API key.", parent=win)
+                return
+            p = self._save_env(pairs)
+            self._refresh_key_status()
+            messagebox.showinfo("Connected", f"Saved to:\n{p}", parent=win)
+            win.destroy()
+
+        btns = tk.Frame(body, bg=BG)
+        btns.pack(fill="x", pady=(12, 0))
+        tk.Button(btns, text="Save", command=save, bg=GREEN, fg="#1e1e2e",
+                  font=("Segoe UI", 9, "bold"), relief="flat", padx=14, pady=3,
+                  cursor="hand2").pack(side="right")
+        tk.Button(btns, text="Cancel", command=win.destroy, bg=ENTRY_BG, fg=FG,
+                  font=("Segoe UI", 9), relief="flat", padx=10, pady=3,
+                  cursor="hand2").pack(side="right", padx=(0, 6))
+        win.update_idletasks()
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - win.winfo_width()) // 2)
+        y = self.winfo_rooty() + 120
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        next(iter(entries.values())).focus_set()
+        win.grab_set()
+
+    def _env_path(self) -> Path:
+        """The .env the app reads: next to the EXE when frozen, else the project dir."""
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).parent / ".env"
+        return Path(__file__).resolve().parent / ".env"
+
+    def _save_env(self, pairs: dict[str, str]) -> Path:
+        """Write/refresh KEY=value lines in the .env and apply them right away."""
+        p = self._env_path()
+        lines: list[str] = []
+        if p.exists():
+            try:
+                lines = p.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+        keys = set(pairs)
+        kept = [ln for ln in lines
+                if not ("=" in ln and ln.strip().split("=", 1)[0].strip() in keys)]
+        for k, v in pairs.items():
+            kept.append(f"{k}={v}")
+        p.write_text("\n".join(kept).rstrip() + "\n", encoding="utf-8")
+        for k, v in pairs.items():
+            os.environ[k] = v
+        return p
 
     def browse_file(self):
         path = filedialog.askopenfilename(filetypes=[("PDF files", "*.pdf")])
@@ -367,16 +477,17 @@ class App(TkinterDnD.Tk):
 
     def _on_backend_change(self):
         backend = self.backend_var.get()
-        if backend in MODEL_OPTIONS:
-            self.model_row.pack(fill="x", pady=1)
-            self.temp_row.pack(fill="x", pady=1)
-            opts = MODEL_OPTIONS[backend]
-            self.model_combo.config(values=opts)
-            if self.model_var.get() not in opts:
-                self.model_var.set(opts[0])
-        else:
-            self.model_row.pack_forget()
-            self.temp_row.pack_forget()
+        self.model_row.pack(fill="x", pady=1)
+        self.temp_row.pack(fill="x", pady=1)
+        opts = MODEL_OPTIONS.get(backend, [])
+        self.model_combo.config(values=opts)
+        current = self.model_var.get()
+        if backend == "custom":
+            # the model id belongs to the user's provider — clear other backends' ids
+            if any(current in v for v in MODEL_OPTIONS.values()):
+                self.model_var.set("")
+        elif opts and current not in opts:
+            self.model_var.set(opts[0])
         self._refresh_key_status()
 
     def _validate(self) -> bool:
@@ -392,7 +503,14 @@ class App(TkinterDnD.Tk):
         except ValueError:
             messagebox.showerror("Error", "Temperature must be a number (e.g. 0.6)")
             return None, None
-        return self.model_var.get().strip() or tb.DEFAULT_MODEL, temp
+        model = self.model_var.get().strip()
+        if self.backend_var.get() == "custom" and not model:
+            messagebox.showerror(
+                "Error",
+                "Enter your provider's model id (e.g. gpt-4o-mini,\n"
+                "or meta/muse-glimmer-30b for NVIDIA endpoints).")
+            return None, None
+        return model or tb.DEFAULT_MODEL, temp
 
     # ---------- actions ----------
 
@@ -409,6 +527,26 @@ class App(TkinterDnD.Tk):
         self.cancel_event.set()
         self.set_status("Cancelling...")
         self.log("Cancel requested — nothing from this run will be saved.")
+
+    def _warn_if_relocated(self, requested: str, actual: str):
+        """Popup when the PDF was saved under a _2-style name because the target was locked."""
+        try:
+            same = (os.path.normcase(os.path.abspath(requested))
+                    == os.path.normcase(os.path.abspath(actual)))
+        except OSError:
+            same = True
+        if same or not actual:
+            return
+        messagebox.showwarning(
+            "Saved under a different name",
+            "Could not save as:\n"
+            f"{requested}\n\n"
+            "because that file is open in another program (PDF viewer).\n\n"
+            "It was saved as:\n"
+            f"{actual}\n\n"
+            "Close the original file and re-run to update the original name —\n"
+            "your progress is kept, so the re-run is quick.\n"
+            "Or just rename the new file yourself.")
 
     def save_progress_to_pdf(self):
         if self.is_running:
@@ -427,12 +565,20 @@ class App(TkinterDnD.Tk):
         messagebox.showinfo(
             "Saved",
             f"Progress merged into the PDF:\n\n{actual}\n\n{pages} pages · {images} images")
+        self._warn_if_relocated(out, actual)
 
     def start_translation(self):
         if self.is_running or not self._validate():
             return
         model, temp = self._model_and_temp()
         if not model or temp is None:
+            return
+
+        if self.backend_var.get() == "custom" and not os.environ.get("CUSTOM_BASE_URL"):
+            messagebox.showerror(
+                "Custom endpoint not set",
+                "Click the Connect… button next to Backend and enter your\n"
+                "API base URL and key first.")
             return
 
         if self.vt_stats:
@@ -496,6 +642,17 @@ class App(TkinterDnD.Tk):
                 status_callback=self.set_status,
                 log_callback=self.log,
             )
+            actual_path = summary.get("output") or output_path
+            relocated_note = ""
+            try:
+                if (os.path.normcase(os.path.abspath(actual_path))
+                        != os.path.normcase(os.path.abspath(output_path))):
+                    relocated_note = (
+                        "\n\n⚠ Saved under a different name — the original file is\n"
+                        "open in another program. Close it and re-run to update\n"
+                        "the original (progress is kept), or rename this file.")
+            except OSError:
+                pass
             if summary.get("cancelled"):
                 self.after(0, lambda: messagebox.showinfo(
                     "Cancelled",
@@ -505,17 +662,17 @@ class App(TkinterDnD.Tk):
             elif summary.get("stopped"):
                 self.after(0, lambda: messagebox.showinfo(
                     "Stopped & saved",
-                    f"Stopped. {summary.get('pages_in_output', 0)} pages are already in:\n{output_path}\n\n"
+                    f"Stopped. {summary.get('pages_in_output', 0)} pages are already in:\n{actual_path}{relocated_note}\n\n"
                     "Re-run with the same settings to continue."))
             else:
                 self.after(0, lambda: messagebox.showinfo(
                     "Done",
                     f"Translation complete!\n\n{summary.get('pages_in_output', 0)} pages · "
-                    f"{summary.get('images', 0)} images\nSaved to:\n{output_path}"))
+                    f"{summary.get('images', 0)} images\nSaved to:\n{actual_path}{relocated_note}"))
         except tb.QuotaExhausted:
             self.after(0, lambda: messagebox.showwarning(
                 "Daily quota reached — partial PDF saved",
-                "Gemini free-tier quota is exhausted.\n\n"
+                "The model's free-tier quota is exhausted.\n\n"
                 "Everything translated so far has been merged into the PDF already.\n"
                 "Re-run tomorrow after midnight (Pacific) to continue —\n"
                 "translated pages are skipped automatically."))

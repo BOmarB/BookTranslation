@@ -19,8 +19,6 @@ pyinstaller --onefile --windowed --name "BookTranslator" ^
   --collect-all google.genai ^
   --collect-submodules google.auth ^
   --collect-submodules google.api ^
-  --collect-all translators ^
-  --collect-all cloudscraper ^
   --collect-submodules PIL ^
   --exclude-module google.cloud ^
   --exclude-module google.genai.tests ^

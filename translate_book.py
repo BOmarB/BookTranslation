@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Book Translator - Gemini / Azure / Google-free edition
+Book Translator - Gemini / NVIDIA / custom OpenAI-compatible edition
 Translates a PDF book page-by-page (whole page, single request), keeping images
 and original page numbers, into Arabic / French / English.
 
@@ -87,9 +87,12 @@ PAGE_LEAD = {
 }
 
 CONTEXT_LEAD = {
-    "ar": "ترجمة الصفحة السابقة (للسياق فقط — لا تترجم هذا الجزء، بل استخدمه للحفاظ على ثبات الأسماء والمصطلحات والأسلوب):",
-    "fr": "Traduction de la page précédente (contexte uniquement — ne traduis pas cette partie, utilise-la pour garder la cohérence des noms, des termes et du ton) :",
-    "en": "Previous page translation (context only — do NOT translate this part; use it to keep names, terms, and tone consistent):",
+    # Neutral "style reference" framing: a "previous page translation" framing
+    # makes the model infer it is mid-way through a full copyrighted novel and
+    # refuse/summarize (verified experimentally on gemini-3.x-flash).
+    "ar": "مرجع أسلوبي من هذا المستند — لا تترجم هذا الجزء، فقط حافظ على الأسلوب والأسماء كما في المرجع:",
+    "fr": "Référence de style tirée de ce document — ne traduis pas cette partie ; garde simplement le style et les noms cohérents avec la référence :",
+    "en": "Style reference from this document — do NOT translate this part; just keep names, terms, and tone consistent with the reference:",
 }
 
 GLOSSARY_LEAD = {
@@ -108,8 +111,8 @@ HEADING_FONT_SIZE = 17
 CONTEXT_TAIL_CHARS = 1200
 
 # Refusal / critic-mode tell-tales. A translation containing one of these is
-# retried once with an explicit correction (REFUSAL_NOTE); if it still trips,
-# it is kept but flagged — never silently dropped.
+# retried with an explicit correction, then once more without glossary/context;
+# if it still trips, it is kept but flagged — never silently dropped.
 COMMENTARY_MARKERS = {
     "ar": [
         # commentary / analysis
@@ -615,123 +618,43 @@ class GeminiBackend:
         raise RuntimeError(f"Translation failed after {MAX_RETRIES} retries: {last_err}")
 
 
-class AzureBackend:
-    """Azure Translator backend: neural MT, free tier 2M chars/month."""
-
-    ENDPOINT = "https://api.cognitive.microsofttranslator.com/translate"
-
-    def __init__(self, key: str | None = None, region: str | None = None, lang: str = DEFAULT_LANG):
-        self.key = key or os.environ.get("AZURE_TRANSLATOR_KEY")
-        self.region = region or os.environ.get("AZURE_TRANSLATOR_REGION") or "global"
-        self.lang = lang
-        if not self.key:
-            raise RuntimeError(
-                "Azure Translator key not found. Set AZURE_TRANSLATOR_KEY (and AZURE_TRANSLATOR_REGION) "
-                "in your environment or .env file, or paste the key in the app."
-            )
-
-    def translate_page(self, text: str, log=None, context: str | None = None,
-                       glossary: dict | None = None, note: str | None = None) -> str:
-        # `note` is accepted for interface compatibility only: neural MT
-        # cannot follow extra instructions.
-        cleaned = clean_page_text(text)
-        if not cleaned:
-            return ""
-
-        last_err = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                response = requests.post(
-                    self.ENDPOINT,
-                    params={"api-version": "3.0", "from": "en", "to": self.lang},
-                    headers={
-                        "Ocp-Apim-Subscription-Key": self.key,
-                        "Ocp-Apim-Subscription-Region": self.region,
-                        "Content-Type": "application/json",
-                    },
-                    json=[{"Text": cleaned[:10000]}],
-                    timeout=60,
-                )
-                if response.status_code == 200:
-                    data = response.json()
-                    return data[0]["translations"][0]["text"].strip()
-                last_err = RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
-            except Exception as e:
-                last_err = e
-            wait = RETRY_BACKOFF * (attempt + 1)
-            if log:
-                log(f"    Azure retry {attempt + 1}/{MAX_RETRIES}: {last_err}")
-            time.sleep(wait)
-
-        raise RuntimeError(f"Azure translation failed after {MAX_RETRIES} retries: {last_err}")
-
-
-class GoogleScrapeBackend:
-    """Free Google Translate via the unofficial `translators` endpoint (no key)."""
-
-    def __init__(self, lang: str = DEFAULT_LANG):
-        self.lang = lang
-        try:
-            import translators as ts
-            self._ts = ts
-        except ImportError as e:
-            raise RuntimeError("The 'translators' package is required for the google-free backend.") from e
-
-    def translate_page(self, text: str, log=None, context: str | None = None,
-                       glossary: dict | None = None, note: str | None = None) -> str:
-        # `note` is accepted for interface compatibility only: neural MT
-        # cannot follow extra instructions.
-        cleaned = clean_page_text(text)
-        if not cleaned:
-            return ""
-
-        last_err = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                result = self._ts.translate_text(
-                    cleaned, translator="google", from_language="en", to_language=self.lang
-                )
-                if result and result.strip():
-                    return result.strip()
-                last_err = RuntimeError("empty result")
-            except Exception as e:
-                msg = str(e).lower()
-                if "too many requests" in msg or "429" in msg:
-                    raise QuotaExhausted(str(e)) from e
-                last_err = e
-
-            wait = RETRY_BACKOFF * (attempt + 1)
-            if log:
-                log(f"    Google-free retry {attempt + 1}/{MAX_RETRIES}: {last_err}")
-            time.sleep(wait)
-
-        raise RuntimeError(f"Google-free translation failed after {MAX_RETRIES} retries: {last_err}")
-
-
-class NvidiaBackend:
-    """NVIDIA NIM backend: OpenAI-compatible chat completions, text only.
+class OpenAICompatBackend:
+    """OpenAI-compatible chat-completions backend (NVIDIA NIM, OpenAI, OpenRouter,
+    DeepSeek, Groq, local Ollama / llama.cpp ...), text only.
 
     Sends the same system prompt and the same text blocks as the Gemini
-    backend (page text + optional previous-page context). Muse Glimmer is a
-    reasoning model whose thinking cannot be disabled (NVIDIA NIM docs), so
-    reasoning_effort is set low and a generous token budget is used; the
-    chain-of-thought in message.reasoning / message.reasoning_content is
-    ignored and only the final message.content is used. Images / PDF metadata
-    are never sent anywhere.
+    backend (page text + optional previous-page context + optional name
+    glossary + optional corrective note). Reasoning output (message.reasoning /
+    message.reasoning_content) is ignored — only the final message.content is
+    used. Images / PDF metadata are never sent anywhere.
     """
 
-    ENDPOINT = NVIDIA_ENDPOINT
-
-    def __init__(self, api_key: str | None = None, model: str = NVIDIA_DEFAULT_MODEL,
-                 temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG):
-        self.key = api_key or os.environ.get("NVIDIA_API_KEY")
-        self.model = (model or NVIDIA_DEFAULT_MODEL).strip()
+    def __init__(self, base_url: str, api_key: str | None = None, model: str = "",
+                 temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG,
+                 key_env: str = "API_KEY", require_key: bool = True,
+                 extra_payload: dict | None = None,
+                 max_tokens: int = NVIDIA_MAX_TOKENS, label: str = "API"):
+        self.base_url = (base_url or "").strip().rstrip("/")
+        if not self.base_url:
+            raise RuntimeError(
+                "No API base URL configured. Click Connect… in the app or set "
+                "CUSTOM_BASE_URL in .env (e.g. https://api.openai.com/v1).")
+        self.endpoint = self.base_url
+        if not self.endpoint.endswith("/chat/completions"):
+            self.endpoint += "/chat/completions"
+        self.key = api_key or os.environ.get(key_env)
+        self.model = (model or "").strip()
+        if not self.model:
+            raise RuntimeError(f"{label}: no model id set — enter one in the Model field.")
         self.temperature = temperature
         self.lang = lang if lang in SYSTEM_PROMPTS else DEFAULT_LANG
-        if not self.key:
+        self.extra_payload = dict(extra_payload or {})
+        self.max_tokens = max_tokens
+        self.label = label
+        if require_key and not self.key:
             raise RuntimeError(
-                "NVIDIA API key not found. Set NVIDIA_API_KEY in your environment "
-                "or .env file (get one at build.nvidia.com).")
+                f"{label} key not found. Set {key_env} in your environment or "
+                ".env file, or click Connect… in the app.")
 
     def translate_page(self, text: str, log=None, context: str | None = None,
                        glossary: dict | None = None, note: str | None = None) -> str:
@@ -760,18 +683,19 @@ class NvidiaBackend:
                 {"role": "user", "content": contents},
             ],
             "temperature": self.temperature,
-            "max_tokens": NVIDIA_MAX_TOKENS,
+            "max_tokens": self.max_tokens,
             "stream": False,
         }
-        if NVIDIA_REASONING_EFFORT:
-            payload["reasoning_effort"] = NVIDIA_REASONING_EFFORT
-        headers = {"Authorization": f"Bearer {self.key}", "Accept": "application/json"}
+        payload.update(self.extra_payload)
+        headers = {"Accept": "application/json"}
+        if self.key:
+            headers["Authorization"] = f"Bearer {self.key}"
 
         last_err = None
         last_retryable = False
         for attempt in range(MAX_RETRIES):
             try:
-                r = requests.post(self.ENDPOINT, headers=headers, json=payload, timeout=600)
+                r = requests.post(self.endpoint, headers=headers, json=payload, timeout=600)
                 if r.status_code == 200:
                     data = r.json()
                     choices = data.get("choices") or []
@@ -795,20 +719,20 @@ class NvidiaBackend:
                     last_retryable = True
                 else:
                     raise RuntimeError(
-                        f"NVIDIA API error (HTTP {r.status_code}): {r.text[:300]}")
+                        f"{self.label} API error (HTTP {r.status_code}): {r.text[:300]}")
             except requests.RequestException as e:
                 last_err = e
                 last_retryable = True
 
             wait = RETRY_BACKOFF * (attempt + 1)
-            log(f"    NVIDIA retry {attempt + 1}/{MAX_RETRIES} after: {last_err}")
+            log(f"    {self.label} retry {attempt + 1}/{MAX_RETRIES} after: {last_err}")
             log(f"    Waiting {wait}s...")
             time.sleep(wait)
 
         if last_retryable:
             raise TransientFailure(
-                f"NVIDIA endpoint unavailable after {MAX_RETRIES} retries: {last_err}") from last_err
-        raise RuntimeError(f"NVIDIA translation failed after {MAX_RETRIES} retries: {last_err}")
+                f"{self.label} endpoint unavailable after {MAX_RETRIES} retries: {last_err}") from last_err
+        raise RuntimeError(f"{self.label} translation failed after {MAX_RETRIES} retries: {last_err}")
 
 
 def progress_path_for(output_path: str) -> Path:
@@ -1111,15 +1035,33 @@ def build_pdf(entries: list[tuple[int, str, list[dict]]], output_path: str,
 
 def make_backend(backend: str, api_key: str | None = None, model: str = DEFAULT_MODEL,
                  temperature: float = DEFAULT_TEMPERATURE, lang: str = DEFAULT_LANG,
-                 azure_key: str | None = None, azure_region: str | None = None):
-    if backend == "azure":
-        return AzureBackend(key=azure_key, region=azure_region, lang=lang)
-    if backend == "google-free":
-        return GoogleScrapeBackend(lang=lang)
+                 base_url: str | None = None):
     if backend == "nvidia":
         if not model or model == DEFAULT_MODEL:
             model = NVIDIA_DEFAULT_MODEL
-        return NvidiaBackend(api_key=api_key, model=model, temperature=temperature, lang=lang)
+        return OpenAICompatBackend(
+            base_url=NVIDIA_ENDPOINT, api_key=api_key, model=model,
+            temperature=temperature, lang=lang, key_env="NVIDIA_API_KEY",
+            require_key=True, label="NVIDIA",
+            extra_payload=({"reasoning_effort": NVIDIA_REASONING_EFFORT}
+                           if NVIDIA_REASONING_EFFORT else None),
+        )
+    if backend == "custom":
+        b = (base_url or os.environ.get("CUSTOM_BASE_URL") or "").strip()
+        if not b:
+            raise RuntimeError(
+                "Custom backend needs an API base URL. Click Connect… in the app "
+                "or set CUSTOM_BASE_URL in .env (e.g. https://api.openai.com/v1).")
+        if not model or model == DEFAULT_MODEL:
+            raise RuntimeError(
+                "Custom backend needs a model id. Enter one in the Model field "
+                "(e.g. gpt-4o-mini) or pass -m on the command line.")
+        return OpenAICompatBackend(
+            base_url=b, api_key=api_key or os.environ.get("CUSTOM_API_KEY"),
+            model=model, temperature=temperature, lang=lang,
+            key_env="CUSTOM_API_KEY", require_key=False,
+            label="Custom endpoint",
+        )
     return GeminiBackend(api_key=api_key, model=model, temperature=temperature, lang=lang)
 
 
@@ -1172,8 +1114,7 @@ def run_translation(
     model: str = DEFAULT_MODEL,
     temperature: float = DEFAULT_TEMPERATURE,
     lang: str = DEFAULT_LANG,
-    azure_key: str | None = None,
-    azure_region: str | None = None,
+    base_url: str | None = None,
     pages: str = "",
     title: str = "",
     spacing: float = REQUEST_SPACING,
@@ -1206,7 +1147,7 @@ def run_translation(
     if in_path.resolve() == out_path.resolve():
         raise ValueError("Output file must be different from the input file.")
 
-    translator = make_backend(backend, api_key, model, temperature, lang, azure_key, azure_region)
+    translator = make_backend(backend, api_key, model, temperature, lang, base_url)
     log(f"Backend: {backend}" + (f" ({model})" if backend in ("gemini", "nvidia") else "") + f" | Language: {LANGUAGES.get(lang, lang)}")
 
     status("Extracting text...")
@@ -1339,10 +1280,11 @@ def run_translation(
                 cancelled = True
                 log("Cancel requested — discarding the page just translated.")
                 break
-            # 1) Refusal / commentary guard: one corrective retry, then fall
+            # 1) Refusal / commentary guard: two corrective retries, then fall
             #    back to the previously saved page if that one was clean.
             suspects = find_commentary(arabic, lang)
             if suspects:
+                note = REFUSAL_NOTE.get(lang) or REFUSAL_NOTE[DEFAULT_LANG]
                 log(f"    WARNING: page {page_idx + 1} looks like a refusal or "
                     f"summary (matched: {', '.join(suspects)}) — retrying once "
                     "with a stricter instruction...")
@@ -1350,19 +1292,28 @@ def run_translation(
                     all_pages[page_idx], log=log,
                     context=prev_translation or None,
                     glossary=glossary or None,
-                    note=REFUSAL_NOTE.get(lang) or REFUSAL_NOTE[DEFAULT_LANG],
+                    note=note,
                 )
                 if retry:
                     arabic = retry
                     suspects = find_commentary(arabic, lang)
                 if suspects:
+                    log("    Still looks wrong — retrying once more without "
+                        "glossary/context (less for the model to recognize)...")
+                    retry2 = translator.translate_page(
+                        all_pages[page_idx], log=log, note=note,
+                    )
+                    if retry2:
+                        arabic = retry2
+                        suspects = find_commentary(arabic, lang)
+                if suspects:
                     prev_saved = prev_text_map.get(page_idx, "").strip()
                     if prev_saved and not find_commentary(prev_saved, lang):
-                        log("    Retry still looks wrong — keeping the previously "
+                        log("    Retries still look wrong — keeping the previously "
                             "saved translation for this page.")
                         arabic = prev_saved
                     else:
-                        log("    Retry still looks wrong — keeping it, flagged for review.")
+                        log("    Retries still look wrong — keeping it, flagged for review.")
                     needs_flag = True
                 else:
                     log("    Retry produced a proper translation.")
@@ -1462,13 +1413,13 @@ def run_translation(
 def test_one_page(input_path: str, page_number: int = 1, api_key: str | None = None,
                   backend: str = "gemini", lang: str = DEFAULT_LANG,
                   model: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE,
-                  azure_key: str | None = None, azure_region: str | None = None) -> tuple[str, str]:
+                  base_url: str | None = None) -> tuple[str, str]:
     """Translate a single page for quality testing. Returns (english, translation)."""
     pages = extract_text_from_pdf(input_path)
     if not 1 <= page_number <= len(pages):
         raise ValueError(f"Page {page_number} out of range (book has {len(pages)} pages)")
     english = clean_page_text(pages[page_number - 1])
-    translator = make_backend(backend, api_key, model, temperature, lang, azure_key, azure_region)
+    translator = make_backend(backend, api_key, model, temperature, lang, base_url)
     translated = translator.translate_page(pages[page_number - 1])
     return english, translated
 
@@ -1506,13 +1457,16 @@ def main():
     parser = argparse.ArgumentParser(description="Translate a PDF book")
     parser.add_argument("--input", "-i", required=True, help="Input PDF path")
     parser.add_argument("--output", "-o", default="translated.pdf", help="Output PDF path")
-    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Model id, Gemini or NVIDIA (default: {DEFAULT_MODEL})")
+    parser.add_argument("--model", "-m", default=DEFAULT_MODEL, help=f"Model id for the selected backend (default: {DEFAULT_MODEL})")
     parser.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
     parser.add_argument("--lang", "-l", choices=list(LANGUAGES), default=DEFAULT_LANG, help="Target language (default: ar)")
     parser.add_argument("--pages", "-p", type=str, default="", help="Page range, e.g. '20-44' or '1,3,5-8'")
     parser.add_argument("--title", "-t", type=str, default="", help="Book title for header")
     parser.add_argument("--spacing", type=float, default=REQUEST_SPACING, help="Seconds between requests (default: 4)")
-    parser.add_argument("--backend", "-b", choices=["gemini", "azure", "nvidia", "google-free"], default="gemini")
+    parser.add_argument("--backend", "-b", choices=["gemini", "nvidia", "custom"], default="gemini",
+                        help="gemini (AI Studio), nvidia (NIM), or custom (any OpenAI-compatible API)")
+    parser.add_argument("--base-url", default=None,
+                        help="Base URL for the custom backend, e.g. https://api.openai.com/v1")
     parser.add_argument("--force", action="store_true", help="Retranslate selected pages, ignoring their saved progress")
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start over")
     args = parser.parse_args()
@@ -1522,6 +1476,7 @@ def main():
             input_path=args.input,
             output_path=args.output,
             backend=args.backend,
+            base_url=args.base_url,
             model=args.model,
             temperature=args.temperature,
             lang=args.lang,
