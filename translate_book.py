@@ -1006,15 +1006,20 @@ def _increment_path(path: str) -> str:
 
 
 def build_pdf(entries: list[tuple[int, str, list[dict]]], output_path: str,
-              title: str = "", lang: str = DEFAULT_LANG) -> str:
+              title: str = "", lang: str = DEFAULT_LANG,
+              locked_callback=None) -> str:
     """Write the translated book.
 
-    If the target file is locked (open in a viewer, read-only, ...), retries
-    with incremented names (_2, _3, ...). Returns the path actually written.
-    Raises PermissionError only if every variant fails.
+    If the target file is locked (open in a viewer, read-only, ...), asks
+    locked_callback(path) ONCE what to do: "retry" means the user closed the
+    file — try the same name again; anything else saves a _2/_3 copy.
+    Without a callback the old silent _2 fallback is used.
+    Returns the path actually written. Raises PermissionError only if every
+    variant fails.
     """
     target = str(output_path)
     renamed = False
+    asked = False
     for attempt in range(51):
         pdf = TranslatedPDF(title=title, lang=lang)
         for page_number, text, images in entries:
@@ -1026,6 +1031,15 @@ def build_pdf(entries: list[tuple[int, str, list[dict]]], output_path: str,
                 print(f"    (target was locked — saved as {target})")
             return target
         except PermissionError:
+            if not asked and not renamed and locked_callback is not None:
+                asked = True
+                action = "copy"
+                try:
+                    action = locked_callback(target)
+                except Exception:
+                    action = "copy"
+                if action == "retry":
+                    continue  # user closed the viewer — try the same name again
             renamed = True
             target = _increment_path(target)
     raise PermissionError(
@@ -1066,7 +1080,8 @@ def make_backend(backend: str, api_key: str | None = None, model: str = DEFAULT_
 
 
 def _build_output_pdf(input_path: str, output_path: str, selected: set[int], title: str,
-                      lang: str, log=None) -> tuple[int, int, str]:
+                      lang: str, log=None,
+                      locked_callback=None) -> tuple[int, int, str]:
     """Extract images from the source and merge all translated pages into the PDF.
 
     Works with whatever is in the progress file so far — used both on normal
@@ -1080,7 +1095,8 @@ def _build_output_pdf(input_path: str, output_path: str, selected: set[int], tit
         done_map = load_progress(output_path, input_path)
         page_indices = sorted(set(done_map.keys()) | set(selected))
         entries = [(i + 1, done_map.get(i, ""), image_map.get(i, [])) for i in page_indices]
-        actual = build_pdf(entries, output_path, title=title, lang=lang)
+        actual = build_pdf(entries, output_path, title=title, lang=lang,
+                           locked_callback=locked_callback)
         if actual != output_path:
             log(f"    (target was locked — saved as {actual})")
         image_count = sum(len(v) for v in image_map.values())
@@ -1125,6 +1141,7 @@ def run_translation(
     log_callback=None,
     status_callback=None,
     progress_callback=None,
+    locked_callback=None,
 ) -> dict:
     """Translate the whole book. Returns a summary dict.
 
@@ -1346,7 +1363,8 @@ def run_translation(
             log("Merging translated pages into the PDF now...")
             status("Merging progress into PDF...")
             pages_done, imgs, actual = _build_output_pdf(
-                str(in_path), str(out_path), selected, title, lang, log)
+                str(in_path), str(out_path), selected, title, lang, log,
+                locked_callback=locked_callback)
             log(f"Partial PDF saved: {actual} ({pages_done} pages, {imgs} images)")
             log(hint + "already-translated pages are skipped automatically.")
             raise
@@ -1391,7 +1409,8 @@ def run_translation(
     status("Extracting images + building PDF...")
     log("Extracting images from source PDF and building the PDF...")
     pages_done, images_added, actual_path = _build_output_pdf(
-        str(in_path), str(out_path), selected, title, lang, log)
+        str(in_path), str(out_path), selected, title, lang, log,
+        locked_callback=locked_callback)
 
     elapsed = time.time() - start_time
     log(f"\nDone! Output saved to: {actual_path}")
@@ -1425,7 +1444,8 @@ def test_one_page(input_path: str, page_number: int = 1, api_key: str | None = N
 
 
 def merge_progress_to_pdf(input_path: str, output_path: str, title: str = "",
-                          lang: str = DEFAULT_LANG) -> tuple[int, int, str]:
+                          lang: str = DEFAULT_LANG,
+                          locked_callback=None) -> tuple[int, int, str]:
     """Merge all pages recorded in the progress file into the output PDF.
 
     Independent of a translation run — used by the GUI's
@@ -1445,7 +1465,8 @@ def merge_progress_to_pdf(input_path: str, output_path: str, title: str = "",
     try:
         image_map = extract_images(str(in_path), tmp_dir, page_indices=selected)
         entries = [(i + 1, done.get(i, ""), image_map.get(i, [])) for i in sorted(selected)]
-        actual = build_pdf(entries, output_path, title=title, lang=lang)
+        actual = build_pdf(entries, output_path, title=title, lang=lang,
+                           locked_callback=locked_callback)
         rendered = sum(1 for _, text, imgs in entries if text.strip() or imgs)
         images = sum(len(v) for v in image_map.values())
         return rendered, images, actual

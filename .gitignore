@@ -11,3 +11,6 @@ __pycache__/
 # Book data (user content + progress state)
 *.pdf
 *.progress.jsonl
+
+# Office/LibreOffice lock files
+.~lock.*

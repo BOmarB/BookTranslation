@@ -528,25 +528,42 @@ class App(TkinterDnD.Tk):
         self.set_status("Cancelling...")
         self.log("Cancel requested — nothing from this run will be saved.")
 
-    def _warn_if_relocated(self, requested: str, actual: str):
-        """Popup when the PDF was saved under a _2-style name because the target was locked."""
-        try:
-            same = (os.path.normcase(os.path.abspath(requested))
-                    == os.path.normcase(os.path.abspath(actual)))
-        except OSError:
-            same = True
-        if same or not actual:
-            return
-        messagebox.showwarning(
-            "Saved under a different name",
-            "Could not save as:\n"
-            f"{requested}\n\n"
-            "because that file is open in another program (PDF viewer).\n\n"
-            "It was saved as:\n"
-            f"{actual}\n\n"
-            "Close the original file and re-run to update the original name —\n"
-            "your progress is kept, so the re-run is quick.\n"
-            "Or just rename the new file yourself.")
+    def _ask_locked_pdf(self, path: str) -> str:
+        """Ask before saving when the output PDF is open in another program.
+
+        Blocks until the user clicks OK. Returns "retry": the save then tries
+        the same name once more — if the viewer was closed it saves normally,
+        if it is still open a _2 copy is written. Safe to call from the worker
+        thread: the dialog itself runs on the Tk thread.
+        """
+        def ask():
+            messagebox.showwarning(
+                "PDF is open — close it to save normally",
+                "The output PDF is open in another program:\n\n"
+                f"{path}\n\n"
+                "• Close that file now, then click OK — the PDF will be "
+                "saved to the same file.\n"
+                "• Or click OK without closing it — the PDF will be saved "
+                "as a new copy instead:\n"
+                f"  {tb._increment_path(path)}")
+
+        if threading.current_thread() is threading.main_thread():
+            ask()
+            return "retry"
+
+        result = {"action": "copy"}
+        done = threading.Event()
+
+        def ask_and_set():
+            try:
+                ask()
+                result["action"] = "retry"
+            finally:
+                done.set()
+
+        self.after(0, ask_and_set)
+        done.wait()
+        return result["action"]
 
     def save_progress_to_pdf(self):
         if self.is_running:
@@ -557,7 +574,8 @@ class App(TkinterDnD.Tk):
         out = self.output_path_for()
         try:
             pages, images, actual = tb.merge_progress_to_pdf(
-                path, out, title=self.title_str.get().strip(), lang=self._lang_code())
+                path, out, title=self.title_str.get().strip(), lang=self._lang_code(),
+                locked_callback=self._ask_locked_pdf)
         except Exception as e:
             messagebox.showerror("Cannot merge", str(e))
             return
@@ -565,7 +583,6 @@ class App(TkinterDnD.Tk):
         messagebox.showinfo(
             "Saved",
             f"Progress merged into the PDF:\n\n{actual}\n\n{pages} pages · {images} images")
-        self._warn_if_relocated(out, actual)
 
     def start_translation(self):
         if self.is_running or not self._validate():
@@ -641,6 +658,7 @@ class App(TkinterDnD.Tk):
                 progress_callback=self.set_progress,
                 status_callback=self.set_status,
                 log_callback=self.log,
+                locked_callback=self._ask_locked_pdf,
             )
             actual_path = summary.get("output") or output_path
             relocated_note = ""

@@ -89,9 +89,10 @@ chat-completions payload, so anything that speaks that dialect works.
   exactly as they were before the run.
 - Progress is stored in `<output>.pdf.progress.jsonl`. Deleting it re-translates
   everything; keeping it lets runs resume quickly.
-- If the output PDF is open in a viewer, the app can't overwrite it and saves a
-  `..._2.pdf` copy instead — it warns you when that happens. Close the viewer and
-  re-run to update the original.
+- If the output PDF is open in a viewer when the run finishes, the app stops and
+  warns you first: **close the file, then click OK** and the PDF is saved to the
+  same name — or **click OK without closing it** and a `..._2.pdf` copy is created
+  instead.
 
 ## Refusal handling (automatic)
 
@@ -117,8 +118,9 @@ retry ladder plus the neutral "style reference" framing keep translations flowin
   continues automatically.
 - **NVIDIA 504 / Gateway Timeout / very slow** — normal for the free NIM tier; the
   app retries automatically. Prefer other models for quick tests.
-- **`..._2.pdf` created** — your target PDF is open in a PDF viewer. Close it and
-  re-run; progress is kept, so the re-run is fast.
+- **`..._2.pdf` created** — you clicked OK on the "PDF is open" warning without
+  closing the target PDF. Close it and click **Save** (or re-run) to update the
+  original; progress is kept, so it's fast. Otherwise just use the `_2` copy.
 - **"No … key"** — click **Connect…** and paste a key, or add it to `.env`.
 - **A page looks like a summary** — it was kept because no clean translation existed;
   re-run that page range (or leave it selected) and the app will retry it.
