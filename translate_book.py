@@ -95,6 +95,14 @@ CONTEXT_LEAD = {
     "en": "Style reference from this document — do NOT translate this part; just keep names, terms, and tone consistent with the reference:",
 }
 
+NOTE_LEAD = {
+    # Continuity note: story knowledge from earlier pages. Neutral framing and
+    # "do not translate" keep it out of the copyright-refusal pattern.
+    "ar": "ملاحظة استمرارية من هذا المستند — لا تترجمها؛ استخدمها فقط للحفاظ على الشخصيات والمصطلحات والأسلوب:",
+    "fr": "Note de continuité tirée de ce document — ne la traduis pas ; utilise-la seulement pour garder les personnages, les termes et le ton cohérents :",
+    "en": "Continuity note from this document — do NOT translate it; use it only to keep characters, terms, and tone consistent:",
+}
+
 GLOSSARY_LEAD = {
     "ar": "استخدم الترجمات التالية للأسماء والأعلام حرفيًا أينما ظهرت:",
     "fr": "Utilise exactement les traductions suivantes pour les noms propres partout où ils apparaissent :",
@@ -109,6 +117,14 @@ PARA_GAP = 5
 HEADING_FONT_SIZE = 17
 
 CONTEXT_TAIL_CHARS = 1200
+
+# Optional extra context: a short, source-based continuity note cached next to
+# the progress file and shared by any model/backend.
+NOTE_FIRST_SPAN = 30      # pages covered when the note is first built mid-book
+NOTE_MAX_CHARS = 60000    # cap on the source text sent in one note request
+NOTE_TARGET_WORDS = 250   # note length limit
+NOTE_MAX_TOKENS = 900     # output budget for the note
+GLOSSARY_CACHE_VERSION = 1
 
 # Refusal / critic-mode tell-tales. A translation containing one of these is
 # retried with an explicit correction, then once more without glossary/context;
@@ -320,9 +336,11 @@ def extract_name_candidates(all_pages: list[str]) -> list[str]:
     return [k for _, k in kept[:GLOSSARY_MAX_NAMES]]
 
 
-def build_glossary(all_pages: list[str], gemini_backend, lang: str, log=None) -> dict[str, str]:
+def build_glossary(all_pages: list[str], translator, lang: str, log=None) -> dict[str, str]:
     """Translate the book's proper names once, in a single request.
 
+    Uses whichever backend is active (Gemini or OpenAI-compatible), so the
+    glossary is available to NVIDIA/custom models too.
     Returns {english_name: translation}. Never raises — returns {} on failure
     so the translation run can continue without a glossary.
     """
@@ -339,11 +357,9 @@ def build_glossary(all_pages: list[str], gemini_backend, lang: str, log=None) ->
         "one per line, no numbering, no commentary:\n" + "\n".join(names)
     )
     try:
-        resp = gemini_backend.client.models.generate_content(
-            model=gemini_backend.model, contents=prompt
-        )
+        text = translator.complete(prompt, max_tokens=4096)
         glossary: dict[str, str] = {}
-        for line in (resp.text or "").splitlines():
+        for line in (text or "").splitlines():
             if "=" in line:
                 en, _, tr = line.partition("=")
                 en, tr = en.strip(), tr.strip()
@@ -354,6 +370,62 @@ def build_glossary(all_pages: list[str], gemini_backend, lang: str, log=None) ->
     except Exception as e:
         log(f"  Glossary step skipped ({e}); continuing without it.")
         return {}
+
+
+def build_continuity_note(translator, all_pages: list[str], first_page: int,
+                          cached: dict | None, lang: str, log=None) -> tuple[str, int]:
+    """Build or extend a continuity note covering pages 1..first_page-1.
+
+    first_page is a 0-based index: the first page this run will translate.
+    The note is built from the source text (never from another model's
+    translations) and is updated incrementally, so a later model can reuse it.
+    Returns (note_text, pages_covered). Never raises — on failure it returns
+    the cached note unchanged (or "" when there is none).
+    """
+    log = log or (lambda m: print(m, flush=True))
+    if first_page <= 0:
+        return "", 0
+    old_text = ((cached or {}).get("text") or "").strip()
+    through = int((cached or {}).get("through") or 0)
+    if through >= first_page and old_text:
+        return old_text, through
+
+    start = through if old_text else max(0, first_page - NOTE_FIRST_SPAN)
+    chunk_pages = all_pages[start:first_page]
+    chunk = "\n\n".join(
+        f"[Page {i + 1}]\n{clean_page_text(t)}"
+        for i, t in enumerate(chunk_pages, start=start)
+    )
+    if len(chunk) > NOTE_MAX_CHARS:
+        chunk = chunk[-NOTE_MAX_CHARS:]
+    if not chunk.strip():
+        return old_text, through
+
+    target = LANGUAGES.get(lang, lang)
+    parts = [
+        "You are helping a literary translator keep continuity between the pages "
+        "of a document. Write a compact continuity note in "
+        f"{target} (maximum {NOTE_TARGET_WORDS} words) covering the pages below: "
+        "recurring characters and their relationships, key events, recurring "
+        "terms, and narrative tone. Do not quote or reproduce sentences. "
+        "Return only the note — no title, no commentary, and no summary of the "
+        "whole book; just the facts a translator needs to keep the next pages "
+        "consistent."
+    ]
+    if old_text:
+        parts.append(
+            "Existing note (extend it, keep it under the word limit):\n" + old_text)
+    parts.append("New pages to absorb:\n" + chunk)
+    prompt = "\n\n".join(parts)
+
+    try:
+        note = translator.complete(prompt, max_tokens=NOTE_MAX_TOKENS).strip()
+        if not note:
+            raise RuntimeError("empty continuity note")
+        return note, first_page
+    except Exception as e:
+        log(f"  Continuity note skipped ({e}); continuing without it.")
+        return old_text, through
 
 
 def count_pages(input_path: str) -> int:
@@ -566,8 +638,25 @@ class GeminiBackend:
                 return True
         return False
 
+    def complete(self, prompt: str, max_tokens: int = 4096) -> str:
+        """Single-shot text request for helper tasks (glossary, continuity note).
+
+        Deliberately does NOT reuse self.config: its system instruction is the
+        page-translation prompt, which would corrupt these helper outputs.
+        """
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=max_tokens,
+            ),
+        )
+        return (response.text or "").strip()
+
     def translate_page(self, text: str, log=None, context: str | None = None,
-                       glossary: dict | None = None, note: str | None = None) -> str:
+                       glossary: dict | None = None, note: str | None = None,
+                       background: str | None = None) -> str:
         log = log or (lambda m: print(m, flush=True))
         prepared = prepare_page_text(text)
         if not prepared:
@@ -579,6 +668,8 @@ class GeminiBackend:
                 GLOSSARY_LEAD[self.lang] + "\n"
                 + "\n".join(f"{k} = {v}" for k, v in glossary.items())
             )
+        if background:
+            parts.append(NOTE_LEAD[self.lang] + "\n" + background)
         if context:
             parts.append(CONTEXT_LEAD[self.lang] + "\n" + context + "\n---")
         parts.append(PAGE_LEAD[self.lang] + "\n" + prepared)
@@ -657,7 +748,8 @@ class OpenAICompatBackend:
                 ".env file, or click Connect… in the app.")
 
     def translate_page(self, text: str, log=None, context: str | None = None,
-                       glossary: dict | None = None, note: str | None = None) -> str:
+                       glossary: dict | None = None, note: str | None = None,
+                       background: str | None = None) -> str:
         log = log or (lambda m: print(m, flush=True))
         prepared = prepare_page_text(text)
         if not prepared:
@@ -669,6 +761,8 @@ class OpenAICompatBackend:
                 GLOSSARY_LEAD[self.lang] + "\n"
                 + "\n".join(f"{k} = {v}" for k, v in glossary.items())
             )
+        if background:
+            parts.append(NOTE_LEAD[self.lang] + "\n" + background)
         if context:
             parts.append(CONTEXT_LEAD[self.lang] + "\n" + context + "\n---")
         parts.append(PAGE_LEAD[self.lang] + "\n" + prepared)
@@ -676,14 +770,37 @@ class OpenAICompatBackend:
             parts.append(note)
         contents = "\n\n".join(parts)
 
+        return self._chat(
+            contents,
+            system=SYSTEM_PROMPTS[self.lang],
+            max_tokens=self.max_tokens,
+            temperature=self.temperature,
+            log=log,
+        )
+
+    def complete(self, prompt: str, max_tokens: int = 4096) -> str:
+        """Single-shot text request for helper tasks (glossary, continuity note)."""
+        return self._chat(
+            prompt,
+            system=("You are a precise assistant. Follow the requested output "
+                    "format exactly; return no commentary."),
+            max_tokens=max_tokens,
+            temperature=0.2,
+        )
+
+    def _chat(self, contents: str, system: str, max_tokens: int,
+              temperature: float, log=None) -> str:
+        """POST one chat completion with the same retry/quota behavior as page
+        translation. Shared by translate_page() and complete()."""
+        log = log or (lambda m: None)
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPTS[self.lang]},
+                {"role": "system", "content": system},
                 {"role": "user", "content": contents},
             ],
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
             "stream": False,
         }
         payload.update(self.extra_payload)
@@ -732,11 +849,113 @@ class OpenAICompatBackend:
         if last_retryable:
             raise TransientFailure(
                 f"{self.label} endpoint unavailable after {MAX_RETRIES} retries: {last_err}") from last_err
-        raise RuntimeError(f"{self.label} translation failed after {MAX_RETRIES} retries: {last_err}")
+        raise RuntimeError(f"{self.label} request failed after {MAX_RETRIES} retries: {last_err}")
 
 
 def progress_path_for(output_path: str) -> Path:
     return Path(output_path).with_suffix(Path(output_path).suffix + ".progress.jsonl")
+
+
+def glossary_cache_path_for(output_path: str) -> Path:
+    p = Path(output_path)
+    return p.with_suffix(p.suffix + ".glossary.json")
+
+
+def context_cache_path_for(output_path: str) -> Path:
+    p = Path(output_path)
+    return p.with_suffix(p.suffix + ".context.json")
+
+
+def _source_meta(input_path: str) -> dict:
+    try:
+        size = Path(input_path).stat().st_size
+    except OSError:
+        size = -1
+    return {"input": str(Path(input_path).resolve()), "size": size}
+
+
+def _read_json_cache(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json_cache(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def load_cached_glossary(output_path: str, input_path: str, lang: str) -> dict[str, str] | None:
+    """Saved name glossary for this book/language, shared by every model."""
+    data = _read_json_cache(glossary_cache_path_for(output_path))
+    if not data or data.get("lang") != lang:
+        return None
+    meta = _source_meta(input_path)
+    if data.get("input") != meta["input"] or data.get("size") != meta["size"]:
+        return None
+    if data.get("version") != GLOSSARY_CACHE_VERSION:
+        return None
+    glossary = data.get("glossary")
+    if not isinstance(glossary, dict) or not glossary:
+        return None
+    return {str(k): str(v) for k, v in glossary.items()}
+
+
+def save_cached_glossary(output_path: str, input_path: str, lang: str,
+                         glossary: dict[str, str]) -> None:
+    if not glossary:
+        return
+    data = {
+        **_source_meta(input_path),
+        "lang": lang,
+        "version": GLOSSARY_CACHE_VERSION,
+        "glossary": glossary,
+    }
+    try:
+        _write_json_cache(glossary_cache_path_for(output_path), data)
+    except OSError:
+        pass
+
+
+def load_cached_note(output_path: str, input_path: str, lang: str) -> dict | None:
+    """Saved continuity note + how many source pages it covers."""
+    data = _read_json_cache(context_cache_path_for(output_path))
+    if not data or data.get("lang") != lang:
+        return None
+    meta = _source_meta(input_path)
+    if data.get("input") != meta["input"] or data.get("size") != meta["size"]:
+        return None
+    through = data.get("through")
+    text = data.get("text")
+    if not isinstance(through, int) or through < 0 or not isinstance(text, str):
+        return None
+    return {"through": through, "text": text}
+
+
+def save_cached_note(output_path: str, input_path: str, lang: str,
+                     through: int, text: str) -> None:
+    if not text.strip():
+        return
+    data = {
+        **_source_meta(input_path),
+        "lang": lang,
+        "through": through,
+        "text": text,
+    }
+    try:
+        _write_json_cache(context_cache_path_for(output_path), data)
+    except OSError:
+        pass
 
 
 def init_progress(output_path: str, input_path: str) -> None:
@@ -1136,6 +1355,7 @@ def run_translation(
     spacing: float = REQUEST_SPACING,
     resume: bool = True,
     force: bool = False,
+    extra_context: bool = False,
     should_stop=None,
     should_cancel=None,
     log_callback=None,
@@ -1150,6 +1370,9 @@ def run_translation(
     Honors should_cancel() between pages: nothing is saved and everything
     this run wrote to the progress file is rolled back (Cancel button).
     force=True retranslates the selected pages, ignoring their saved progress.
+    extra_context=True builds/reuses a short continuity note from earlier source
+    pages (one request when the cached note does not cover the range yet), so a
+    model resuming mid-book knows the story, not just the previous page.
     """
     log = log_callback or (lambda m: print(m, flush=True))
     status = status_callback or (lambda t: None)
@@ -1245,10 +1468,42 @@ def run_translation(
     log(f"Pages selected: {len(target)} | Already done: {len(target) - len(todo)} | Remaining: {len(todo)}")
 
     glossary: dict[str, str] = {}
-    if backend == "gemini" and todo:
-        status("Building name glossary...")
-        log("Building name glossary (one request)...")
-        glossary = build_glossary(all_pages, translator, lang, log)
+    if todo:
+        glossary = load_cached_glossary(str(out_path), str(in_path), lang) or {}
+        if glossary:
+            log(f"Reusing saved glossary ({len(glossary)} names — shared by all models).")
+        else:
+            status("Building name glossary...")
+            log("Building name glossary (one request)...")
+            glossary = build_glossary(all_pages, translator, lang, log)
+            if glossary:
+                save_cached_glossary(str(out_path), str(in_path), lang, glossary)
+
+    # Optional extra context: a short source-based continuity note covering the
+    # pages before this run, cached and shared by every model/backend.
+    background = ""
+    if extra_context and todo and todo[0] > 0:
+        cached_note = load_cached_note(str(out_path), str(in_path), lang)
+        through = cached_note.get("through", 0) if cached_note else 0
+        if cached_note and through >= todo[0]:
+            background = cached_note.get("text", "")
+            log(f"Reusing continuity note (covers pages 1-{through}).")
+        else:
+            if cached_note and (cached_note.get("text") or "").strip():
+                start_page = through + 1
+            else:
+                start_page = max(1, todo[0] - NOTE_FIRST_SPAN + 1)
+            status("Building continuity note...")
+            log(f"Building continuity note for pages {start_page}-{todo[0]} "
+                "(one request)...")
+            background, through = build_continuity_note(
+                translator, all_pages, todo[0], cached_note, lang, log)
+            if background:
+                save_cached_note(str(out_path), str(in_path), lang, through, background)
+                log(f"  Continuity note ready ({len(background.split())} words, "
+                    f"covers pages 1-{through}).")
+            else:
+                background = ""
 
     # Seed context from the previously translated page when resuming,
     # so the first new page keeps consistent names too.
@@ -1292,6 +1547,7 @@ def run_translation(
                 all_pages[page_idx], log=log,
                 context=prev_translation or None,
                 glossary=glossary or None,
+                background=background or None,
             )
             if should_cancel():
                 cancelled = True
@@ -1310,6 +1566,7 @@ def run_translation(
                     context=prev_translation or None,
                     glossary=glossary or None,
                     note=note,
+                    background=background or None,
                 )
                 if retry:
                     arabic = retry
@@ -1344,6 +1601,7 @@ def run_translation(
                     all_pages[page_idx], log=log,
                     context=prev_translation or None,
                     glossary=glossary or None,
+                    background=background or None,
                 )
                 if looks_truncated(len(cleaned), arabic):
                     log("    Still short — keeping it, flagged for review.")
@@ -1489,6 +1747,8 @@ def main():
     parser.add_argument("--base-url", default=None,
                         help="Base URL for the custom backend, e.g. https://api.openai.com/v1")
     parser.add_argument("--force", action="store_true", help="Retranslate selected pages, ignoring their saved progress")
+    parser.add_argument("--extra-context", action="store_true",
+                        help="Add a cached continuity note of earlier pages (one extra request when not cached)")
     parser.add_argument("--fresh", action="store_true", help="Ignore saved progress and start over")
     args = parser.parse_args()
 
@@ -1506,6 +1766,7 @@ def main():
             spacing=args.spacing,
             resume=not args.fresh,
             force=args.force,
+            extra_context=args.extra_context,
         )
     except QuotaExhausted:
         sys.exit(2)

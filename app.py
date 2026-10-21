@@ -67,6 +67,7 @@ class App(TkinterDnD.Tk):
         self.stop_event = threading.Event()
         self.cancel_event = threading.Event()
         self.force_var = tk.BooleanVar(value=False)
+        self.extra_context_var = tk.BooleanVar(value=False)
         self.page_count = 0
         self.vt_stats = None
 
@@ -166,6 +167,13 @@ class App(TkinterDnD.Tk):
         tk.Checkbutton(
             form, text="Redo selected pages (ignore their saved progress)",
             variable=self.force_var, bg=BG, fg=SUBTLE, selectcolor=ENTRY_BG,
+            activebackground=BG, activeforeground=FG, font=("Segoe UI", 8),
+            cursor="hand2",
+        ).pack(anchor="w", pady=(0, 2))
+
+        tk.Checkbutton(
+            form, text="Extra context: continuity note of earlier pages (1 request)",
+            variable=self.extra_context_var, bg=BG, fg=SUBTLE, selectcolor=ENTRY_BG,
             activebackground=BG, activeforeground=FG, font=("Segoe UI", 8),
             cursor="hand2",
         ).pack(anchor="w", pady=(0, 2))
@@ -653,6 +661,7 @@ class App(TkinterDnD.Tk):
                 title=title,
                 resume=resume,
                 force=force,
+                extra_context=self.extra_context_var.get(),
                 should_stop=self.stop_event.is_set,
                 should_cancel=self.cancel_event.is_set,
                 progress_callback=self.set_progress,

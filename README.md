@@ -16,6 +16,9 @@ with the original images kept, an RTL layout for Arabic, and the original page n
   `41-80` tomorrow; the PDF grows and translated pages are skipped automatically.
 - Sends **only the extracted page text** (plus a name glossary and a short style
   reference) to the model. The PDF file, its images, and its metadata are never sent.
+- A **name glossary** is built once per book and language, then cached in
+  `<output>.pdf.glossary.json` — later runs reuse it with **zero** extra requests,
+  and NVIDIA/custom models get the same names Gemini used.
 
 ## Quick start (Windows EXE)
 
@@ -83,6 +86,11 @@ chat-completions payload, so anything that speaks that dialect works.
 - **Pages** syntax: `40` (one page), `1-40`, `40,60-62`, or empty for the whole book.
 - **Redo selected pages (force)**: re-translates pages you typed even if they were
   already done (normally saved pages are skipped).
+- **Extra context (optional)**: when checked, a short continuity note (characters,
+  key events, terms, tone) of the pages before your range is built from the source
+  text and cached in `<output>.pdf.context.json`. Each later run extends it with
+  **one request**, or reuses it with **zero**; translation is still one request per
+  page. Useful when resuming mid-book or switching models — leave it off to save quota.
 - **Stop & Save**: stops the run and merges everything translated so far into the PDF.
   Re-run later to continue where you stopped.
 - **Cancel**: stops and saves **nothing** — the PDF and saved progress are restored
