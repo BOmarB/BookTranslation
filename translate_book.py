@@ -547,55 +547,6 @@ def extract_images(input_path: str, dest_dir: str, page_indices: set[int] | None
     return result
 
 
-def vt_scan_file(path: str, poll_interval: float = 2.0, timeout: float = 120.0) -> dict:
-    """Scan a file with VirusTotal. Returns a summary dict (with 'error' on failure)."""
-    key = os.environ.get("VT_API_KEY")
-    if not key:
-        return {"error": "no key"}
-    try:
-        with open(path, "rb") as f:
-            data = f.read()
-    except OSError as e:
-        return {"error": str(e)}
-
-    headers_base = {"x-apikey": key}
-    try:
-        r = requests.post(
-            "https://www.virustotal.com/api/v3/files",
-            headers=headers_base,
-            files={"file": (Path(path).name, data)},
-            timeout=90,
-        )
-        if r.status_code == 409:
-            # same file submitted moments ago — wait and retry once
-            time.sleep(5)
-            r = requests.post(
-                "https://www.virustotal.com/api/v3/files",
-                headers=headers_base,
-                files={"file": (Path(path).name, data)},
-                timeout=90,
-            )
-        if r.status_code != 200:
-            return {"error": f"HTTP {r.status_code}: {r.text[:200]}"}
-        analysis_id = r.json()["data"]["id"]
-
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            a = requests.get(
-                f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
-                headers={"x-apikey": key},
-                timeout=30,
-            )
-            attrs = a.json().get("data", {}).get("attributes", {})
-            if attrs.get("status") == "completed":
-                stats = attrs.get("stats", {})
-                return {"stats": stats, "error": None}
-            time.sleep(poll_interval)
-        return {"error": "scan timed out"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
 class GeminiBackend:
     """Gemini backend: one call per whole page."""
 

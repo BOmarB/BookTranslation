@@ -1,9 +1,10 @@
 pdfplumber
 google-genai
-requests
+requests==2.34.2
+urllib3==2.8.0
 fpdf2
 arabic-reshaper
 python-bidi
-Pillow
+Pillow==13.0.0
 tkinterdnd2
 pyinstaller

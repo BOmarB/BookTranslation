@@ -69,7 +69,6 @@ class App(TkinterDnD.Tk):
         self.force_var = tk.BooleanVar(value=False)
         self.extra_context_var = tk.BooleanVar(value=False)
         self.page_count = 0
-        self.vt_stats = None
 
         self._set_icon()
         self._build_ui()
@@ -136,11 +135,6 @@ class App(TkinterDnD.Tk):
             bg=ACCENT, fg=BG, font=("Segoe UI", 8, "bold"),
             relief="flat", padx=10, pady=1, cursor="hand2",
         ).pack(pady=(3, 3))
-
-        self.vt_label = tk.Label(self, text="VirusTotal: —", font=("Segoe UI", 8),
-                                 bg=BG, fg=SUBTLE, cursor="hand2")
-        self.vt_label.pack()
-        self.vt_label.bind("<Button-1>", lambda e: self._rescan())
 
         form = tk.Frame(self, bg=BG)
         form.pack(fill="x", padx=24)
@@ -400,8 +394,6 @@ class App(TkinterDnD.Tk):
         self.drop_label.config(text=f"{Path(path).name}  (counting pages...)",
                                fg="#cdd6f4")
         self.page_count = 0
-        self.vt_stats = None
-        self.vt_label.config(text="VirusTotal: scanning...", fg="#89b4fa")
         threading.Thread(target=self._book_info_worker, args=(path,), daemon=True).start()
 
     def _book_info_worker(self, path):
@@ -418,36 +410,6 @@ class App(TkinterDnD.Tk):
             else:
                 self.drop_label.config(text=name)
         self.after(0, upd)
-
-        result = tb.vt_scan_file(path)
-        stats = result.get("stats")
-
-        def vt_upd():
-            if result.get("error") == "no key":
-                self.vt_label.config(text="VirusTotal: no key (skipped)", fg="#6c7086")
-                self.vt_stats = None
-            elif result.get("error"):
-                self.vt_label.config(text=f"VirusTotal: error ({result['error'][:40]})", fg="#f9e2af")
-                self.vt_stats = None
-            else:
-                flagged = (stats.get("malicious", 0) or 0) + (stats.get("suspicious", 0) or 0)
-                total = sum(stats.values()) if stats else 0
-                self.vt_stats = stats
-                if flagged:
-                    self.vt_label.config(
-                        text=f"VirusTotal: ⚠ {flagged} of {total} engines flagged — click to re-scan",
-                        fg="#f38ba8")
-                else:
-                    self.vt_label.config(
-                        text=f"VirusTotal: ✓ clean ({total} engines)", fg="#a6e3a1")
-        self.after(0, vt_upd)
-
-    def _rescan(self):
-        path = self.pdf_path.get()
-        if not path or not Path(path).exists():
-            return
-        self.vt_label.config(text="VirusTotal: re-scanning...", fg="#89b4fa")
-        threading.Thread(target=self._book_info_worker, args=(path,), daemon=True).start()
 
     def output_path_for(self) -> str:
         out_name = self.output_name.get().strip() or "translated"
@@ -605,15 +567,6 @@ class App(TkinterDnD.Tk):
                 "Click the Connect… button next to Backend and enter your\n"
                 "API base URL and key first.")
             return
-
-        if self.vt_stats:
-            flagged = self.vt_stats.get("malicious", 0) + self.vt_stats.get("suspicious", 0)
-            if flagged > 0:
-                go = messagebox.askyesno(
-                    "VirusTotal warning",
-                    f"{flagged} security engines flagged this file.\n\nTranslate it anyway?")
-                if not go:
-                    return
 
         input_path = self.pdf_path.get()
         output_path = self.output_path_for()
