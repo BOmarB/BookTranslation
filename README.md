@@ -23,9 +23,9 @@ with the original images kept, an RTL layout for Arabic, and the original page n
 ## Quick start (Windows EXE)
 
 1. Run `dist\BookTranslator.exe`.
-2. Click **Connect…** next to *Backend* and paste an API key (see below).
+2. Click **Connect…** next to _Backend_ and paste an API key (see below).
 3. Drag a PDF into the window (or **Browse**), pick Language / Model / Title.
-4. Leave *Pages* empty to translate the whole book, then click **Translate**.
+4. Leave _Pages_ empty to translate the whole book, then click **Translate**.
 5. The PDF is saved when the run finishes — or at any time with **Stop & Save**.
 
 Keys can also live in a `.env` file next to the EXE (`dist\.env`). The **Connect…**
@@ -33,14 +33,14 @@ button writes there for you, and rebuilds of the EXE keep that file untouched.
 
 ## Models — which one to pick
 
-| Model | Quality | Quota | Notes |
-|---|---|---|---|
-| `gemini-3-flash-preview` | ★ best | free tier, limited | Best free results for Arabic fiction prose |
-| `gemini-3.8-flash` | ★ best | free tier, **low** | Same family; quotas differ per account |
-| `gemini-flash-lite-latest` | good | larger | Fast and usually more daily quota, but the **meaning can be weaker** on dense prose |
-| `gemini-2.5-flash` | good | medium | Previous generation, dependable |
-| `meta/muse-glimmer-30b` (NVIDIA) | like lite | **much larger** | Can take several minutes per page — start it and leave it running |
-| *custom* | depends | your provider | Any OpenAI-compatible API (see below) |
+| Model                            | Quality | Quota              | Notes                                                                               |
+| -------------------------------- | ------- | ------------------ | ----------------------------------------------------------------------------------- |
+| `gemini-3-flash-preview`         | ★ best  | free tier, limited | Best free results for Arabic fiction prose                                          |
+| `gemini-3.8-flash`               | ★ best  | free tier, **low** | Same family; quotas differ per account                                              |
+| `gemini-flash-lite-latest`       | good    | larger             | Fast and usually more daily quota, but the **meaning can be weaker** on dense prose |
+| `gemini-2.5-flash`               | good    | medium             | Previous generation, dependable                                                     |
+| `meta/muse-glimmer-30b` (NVIDIA) | good    | **much larger**    | Can take several minutes per page — start it and leave it running                   |
+| _custom_                         | depends | your provider      | Any OpenAI-compatible API (see below)                                               |
 
 **If you're on the free tier: use Gemini 3 Flash (`gemini-3-flash-preview`) or
 `gemini-3.8-flash` for better results.** If you need more quota, Flash Lite latest
@@ -50,11 +50,11 @@ wallet.
 
 ### Keys
 
-| Backend | Key | Where to get it |
-|---|---|---|
-| Gemini | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | [aistudio.google.com](https://aistudio.google.com) → Get API key (free) |
-| NVIDIA | `NVIDIA_API_KEY` | [build.nvidia.com](https://build.nvidia.com) → free developer key |
-| Custom | `CUSTOM_API_KEY` | your provider |
+| Backend | Key                                    | Where to get it                                                         |
+| ------- | -------------------------------------- | ----------------------------------------------------------------------- |
+| Gemini  | `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) | [aistudio.google.com](https://aistudio.google.com) → Get API key (free) |
+| NVIDIA  | `NVIDIA_API_KEY`                       | [build.nvidia.com](https://build.nvidia.com) → free developer key       |
+| Custom  | `CUSTOM_API_KEY`                       | your provider                                                           |
 
 Use the **Connect…** button or edit `.env`:
 
@@ -67,7 +67,7 @@ CUSTOM_API_KEY=...
 
 ## Custom backend (bring your own model)
 
-Pick *custom* in the Backend list, click **Connect…**, and enter:
+Pick _custom_ in the Backend list, click **Connect…**, and enter:
 
 - **API base URL** — any OpenAI-compatible endpoint, e.g.
   `https://api.openai.com/v1`,
@@ -101,23 +101,6 @@ chat-completions payload, so anything that speaks that dialect works.
   warns you first: **close the file, then click OK** and the PDF is saved to the
   same name — or **click OK without closing it** and a `..._2.pdf` copy is created
   instead.
-
-## Refusal handling (automatic)
-
-Some models (especially Gemini 3.x Flash) sometimes answer with *"I can't translate
-this due to copyright… here's a summary"* instead of the translation. The app treats
-any such reply as a failed page and:
-
-1. Retries it with a stricter instruction (the page belongs to the user, personal use).
-2. If it still refuses, retries once more **without** the glossary/style reference
-   (less context for the model to recognize the book).
-3. If it still refuses, keeps the previously saved clean translation of that page —
-   or keeps the flagged result and marks it so the next run re-translates it.
-
-You don't have to do anything: refusals are re-tried automatically and never sneak
-into the PDF when a clean translation exists. A model that starts refusing a book
-midway is usually responding to how the request is framed, not to hard blocks — the
-retry ladder plus the neutral "style reference" framing keep translations flowing.
 
 ## Troubleshooting
 
